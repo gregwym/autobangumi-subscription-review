@@ -52,3 +52,46 @@ async def test_empty_include_rejected_and_urls_redacted(plugin, rule, api):
         candidates = await api.get(f"/review/rules/{rule.id}/candidates")
         assert "secret" not in candidates.text
         assert "url" not in candidates.json()[0]
+
+
+async def test_native_version_selection_groups_episodes_and_filters_codec(plugin, rule, api):
+    for ep, codec in [(1, "HEVC"), (2, "HEVC"), (1, "AVC")]:
+        await plugin.bridge.capture(rule, release(ep, variant=codec))
+    async with api:
+        response = await api.get(f"/review/rules/{rule.id}/versions")
+        assert response.status_code == 200
+        versions = response.json()["versions"]
+        assert len(versions) == 2
+        hevc = next(v for v in versions if v["codec"] == "HEVC")
+        assert hevc["count"] == 2
+        assert "magnet:" not in response.text
+        response = await api.post(
+            f"/review/rules/{rule.id}/preview", json={"version_id": hevc["id"], "mode": "backlog"}
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["will_download"] == 2
+        plugin.test_send.assert_not_called()
+        response = await api.post(
+            f"/review/rules/{rule.id}/approve",
+            json={"preview_token": response.json()["preview_token"]},
+        )
+        assert response.status_code == 200
+    await plugin.bridge.replay()
+    assert plugin.test_send.call_count == 2
+    assert all("HEVC" in str(call) for call in plugin.test_send.call_args_list)
+
+
+async def test_unknown_version_and_ambiguous_conditions_refused(plugin, rule, api):
+    await plugin.bridge.capture(rule, release())
+    async with api:
+        response = await api.post(
+            f"/review/rules/{rule.id}/preview", json={"version_id": "unknown"}
+        )
+        assert response.status_code == 409
+        data = (await api.get(f"/review/rules/{rule.id}/versions")).json()
+        response = await api.post(
+            f"/review/rules/{rule.id}/preview",
+            json={"version_id": data["versions"][0]["id"], "include": ["HEVC"]},
+        )
+        assert response.status_code == 422
+    plugin.test_send.assert_not_called()

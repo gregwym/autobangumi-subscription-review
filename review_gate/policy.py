@@ -14,6 +14,7 @@ class Policy:
     mode: str = "future"
     from_episode: float = 1
     cutoff: float = 0
+    version_id: str | None = None
 
     def validate(self):
         if self.mode not in {"future", "backlog"}:
@@ -28,6 +29,12 @@ class Policy:
         return self
 
     def reason(self, candidate: dict) -> str | None:
+        if self.version_id:
+            from .versions import variants
+
+            matches = variants([candidate])
+            if not matches or matches[0]["id"] != self.version_id:
+                return "不是所选下载版本"
         name = candidate["name"].casefold()
         if not all(t.casefold() in name for t in self.include):
             return "缺少必须包含的关键词"

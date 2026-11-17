@@ -2,6 +2,7 @@
 """Build a deterministic installable ZIP with an explicit file allowlist."""
 
 import hashlib
+import tomllib
 import zipfile
 from pathlib import Path
 
@@ -9,7 +10,8 @@ from pathlib import Path
 def build(root):
     out = root / "dist"
     out.mkdir(exist_ok=True)
-    target = out / "subscription-review-0.1.0.zip"
+    version = tomllib.loads((root / "plugin.toml").read_text())["plugin"]["version"]
+    target = out / f"subscription-review-{version}.zip"
     files = [root / "plugin.toml", root / "README.md", root / "LICENSE"]
     files += sorted((root / "review_gate").glob("*.py"))
     files += [root / "web/index.js"]

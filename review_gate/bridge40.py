@@ -234,6 +234,25 @@ class Bridge40:
             "provider": PROVIDER,
         }
 
+    async def activate(self, context):
+        """Use AB's config reload choreography; never expose connection secrets."""
+        from module.conf import settings
+        from module.conf.config import CONFIG_PATH
+
+        from .configuration import configure
+
+        instances = [i for i in settings.plugins.instances if i.point == "downloader"]
+        if not instances or any(i.provider not in {"qbittorrent", PROVIDER} for i in instances):
+            raise ValueError("当前只支持 qBittorrent 下载器，请先检查下载设置")
+        async with self.lock:
+            result = await asyncio.to_thread(
+                configure, CONFIG_PATH, [i.id for i in instances], True
+            )
+        # Reload may call teardown: release the bridge lock before entering it.
+        # On failure the guarded provider stays on disk, never an unsafe fallback.
+        await context.reload_settings()
+        return {"enabled": True, "changed_instances": result["changed_instances"]}
+
     async def reconcile(self, candidate, rule, torrent, instance_id):
         """Repair AB's history after replay, including existing orphan rows.
 

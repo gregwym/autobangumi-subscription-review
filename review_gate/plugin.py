@@ -7,16 +7,18 @@ import time
 
 from ab_sdk import Plugin, Verdict, hook, points, provider
 from ab_sdk.tasks import ScheduledTask
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from .bridge40 import PROVIDER, Bridge40
 from .policy import Policy
 from .store import Store
+from .versions import variants
 
 
 class ReviewRequest(BaseModel):
-    include: list[str] = Field(min_length=1, max_length=32)
+    include: list[str] = Field(default_factory=list, max_length=32)
+    version_id: str | None = Field(default=None, max_length=40)
     exclude: list[str] = Field(default_factory=list, max_length=32)
     mode: str = "future"
     from_episode: float = Field(default=1, ge=0, le=100000)
@@ -75,6 +77,19 @@ class SubscriptionReview(Plugin):
         async def rules():
             return {"health": await self.bridge.health(), "rules": await self.store.rules()}
 
+        @router.post("/activate")
+        async def activate(request: Request):
+            try:
+                return await self.bridge.activate(request.app.state.ctx)
+            except ValueError as e:
+                raise HTTPException(409, str(e)) from e
+
+        @router.get("/rules/{rid}/versions")
+        async def versions(rid: int):
+            rule = await find_rule(rid)
+            items = await self.store.candidates(rid)
+            return {"rule": rule, "versions": variants(items), "health": await self.bridge.health()}
+
         @router.get("/rules/{rid}/candidates")
         async def candidates(rid: int):
             await find_rule(rid)
@@ -93,13 +108,24 @@ class SubscriptionReview(Plugin):
 
         @router.post("/rules/{rid}/preview")
         async def preview(rid: int, body: ReviewRequest):
-            try:
-                policy = Policy(**body.model_dump(), cutoff=time.time()).validate()
-            except ValueError as e:
-                raise HTTPException(422, str(e)) from e
             async with self.bridge.lock:
                 rule = await find_rule(rid)
                 items = await self.store.candidates(rid)
+                data = body.model_dump(exclude={"version_id"})
+                if body.version_id:
+                    selected = next(
+                        (v for v in variants(items) if v["id"] == body.version_id), None
+                    )
+                    if selected is None:
+                        raise HTTPException(409, "这个版本已变化，请刷新后重新选择")
+                    if body.include:
+                        raise HTTPException(422, "请选择版本或使用自定义条件，不能同时设置")
+                    data["include"] = selected["include"]
+                    data["version_id"] = selected["id"]
+                try:
+                    policy = Policy(**data, cutoff=time.time()).validate()
+                except ValueError as e:
+                    raise HTTPException(422, str(e)) from e
                 token = secrets.token_urlsafe(32)
                 # Expiring, bounded preview receipts prevent stale approvals.
                 self.previews = {
@@ -142,7 +168,7 @@ class SubscriptionReview(Plugin):
                 if snapshot(rule["revision"], items) != receipt["snapshot"]:
                     raise HTTPException(409, "候选或规则已变化，请重新预览")
                 await self.store.set_policy(rid, receipt["policy"], receipt["revision"])
-            return {"approved": True, "message": "已批准，后台将在 30 秒内处理符合条件的候选"}
+            return {"approved": True, "message": "已开始追番，后续新集将按此版本自动下载"}
 
         @router.post("/rules/{rid}/hold")
         async def hold(rid: int):
