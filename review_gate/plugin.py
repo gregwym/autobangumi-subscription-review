@@ -5,6 +5,7 @@ import hashlib
 import json
 import secrets
 import time
+from pathlib import Path
 
 from ab_sdk import Plugin, Verdict, hook, points, provider
 from ab_sdk.tasks import ScheduledTask
@@ -14,7 +15,12 @@ from pydantic import BaseModel, Field
 from .bridge40 import PROVIDER, Bridge40
 from .policy import Policy
 from .store import Store
+from .updater import Updater
 from .versions import variants
+
+
+class UpdateRequest(BaseModel):
+    version: str = Field(pattern=r"^\d+\.\d+\.\d+$", max_length=40)
 
 
 class ReviewRequest(BaseModel):
@@ -52,6 +58,7 @@ class SubscriptionReview(Plugin):
         self.store = Store(self.ctx.data_dir / "review.sqlite3")
         await self.store.init()
         self.bridge = Bridge40(self.store, self.ctx.log)
+        self.updater = Updater(Path(__file__).resolve().parents[1], self.ctx.data_dir, self.bridge)
         await self.bridge.setup()
         try:
             await self.bridge.sync_history()
@@ -76,6 +83,10 @@ class SubscriptionReview(Plugin):
     def replay_task(self):
         return ScheduledTask(run=self.bridge.replay, interval=30, initial_delay=30)
 
+    @provider(points.SCHEDULED_TASK, id="check-update")
+    def update_task(self):
+        return ScheduledTask(run=self.updater.check, interval=21600, initial_delay=60)
+
     @provider(points.API_ROUTER, id="api")
     def api(self):
         router = APIRouter()
@@ -85,6 +96,25 @@ class SubscriptionReview(Plugin):
                 if r["id"] == rid:
                     return r
             raise HTTPException(404, "未找到番剧规则")
+
+        @router.get("/update")
+        async def update_status():
+            return self.updater.status()
+
+        @router.post("/update/check")
+        async def update_check():
+            return await self.updater.check()
+
+        @router.post("/update/install")
+        async def update_install(body: UpdateRequest, request: Request):
+            try:
+                async with self.maintenance_lock:
+                    return await self.updater.install(body.version, request.app.state.ctx)
+            except ValueError as e:
+                raise HTTPException(409, str(e)) from e
+            except Exception as e:
+                self.ctx.log.exception("插件更新失败")
+                raise HTTPException(502, "更新服务暂不可用，旧版已保留；请稍后重试") from e
 
         @router.get("/rules")
         async def rules():
@@ -99,6 +129,8 @@ class SubscriptionReview(Plugin):
 
         @router.get("/rules/{rid}/versions")
         async def versions(rid: int):
+            await self.bridge.sync_history()
+            await self.bridge.repair_orphans()
             rule = await find_rule(rid)
             items = await self.store.candidates(rid)
             return {"rule": rule, "versions": variants(items), "health": await self.bridge.health()}
@@ -208,6 +240,7 @@ class SubscriptionReview(Plugin):
         @router.get("/rules/{rid}/history")
         async def history(rid: int):
             try:
+                await self.bridge.sync_history()
                 return await asyncio.to_thread(self.bridge.maintenance().history, rid)
             except ValueError as e:
                 raise HTTPException(409, str(e)) from e
@@ -215,6 +248,7 @@ class SubscriptionReview(Plugin):
         @router.post("/rules/{rid}/history/preview")
         async def history_preview(rid: int, body: HistoryRequest):
             try:
+                await self.bridge.sync_history()
                 async with self.bridge.lock:
                     receipt = await asyncio.to_thread(
                         self.bridge.maintenance().preview, rid, body.episodes

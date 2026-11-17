@@ -161,3 +161,130 @@ async def test_bracket_v2_is_preferred_even_when_ab_parser_omits_revision(plugin
     parsed = plugin.bridge.parsed_data(rule, name)
     assert parsed["episode"] == 3
     assert parsed["revision"] == 2
+
+
+async def test_exact_group_prevents_cross_season_and_repairs_old_held_row(plugin):
+    from module.database import Database
+    from module.models import Bangumi, Torrent
+    from module.rss.engine import RSSEngine
+
+    async with Database() as db:
+        one = Bangumi(
+            official_title="青之箱",
+            title_raw="Ao no Hako Blue Box",
+            season=1,
+            group_name="喵萌奶茶屋&LoliHouse",
+            filter="",
+        )
+        two = Bangumi(
+            official_title="青之箱",
+            title_raw=one.title_raw,
+            season=2,
+            season_offset=-1,
+            group_name="LoliHouse",
+            filter="",
+        )
+        db.add(one)
+        db.add(two)
+        await db.commit()
+        old = Torrent(
+            name="[喵萌奶茶屋&LoliHouse] 青箱 / Ao no Hako / Blue Box - 04 [WebRip 1080p HEVC-10bit AAC][简繁日内封字幕]",
+            url="magnet:?old4",
+            bangumi_id=two.id,
+        )
+        v2 = Torrent(
+            name=old.name.replace("- 04 ", "- 04v2 "),
+            url="magnet:?new4",
+            bangumi_id=one.id,
+            downloaded=True,
+        )
+        db.add(old)
+        db.add(v2)
+        await db.commit()
+        assert RSSEngine(db).match_torrent(old.model_copy(), [two, one]).id == one.id
+    await plugin.bridge.capture(two, old)
+    await plugin.bridge.sync_history()
+    assert not await plugin.store.candidates(two.id)
+    assert {c["episode"] for c in await plugin.store.candidates(one.id)} == {4}
+    async with Database() as db:
+        assert (await db.torrent.search(old.id)).bangumi_id == one.id
+        assert (await db.torrent.search(v2.id)).downloaded
+    await plugin.bridge.sync_history()
+    assert len(await plugin.store.candidates(one.id)) == 2
+    plugin.test_send.assert_not_called()
+
+
+async def test_ambiguous_season_stays_unmatched(plugin, rule):
+    from module.rss.engine import RSSEngine
+
+    newer = rule.model_copy(update={"id": 999, "season": 2})
+    torrent = release()
+    assert RSSEngine(None).match_torrent(torrent, [newer, rule]) is None
+    assert torrent.bangumi_id is None
+
+
+async def test_offset_edit_reindexes_history_and_retains_retry(plugin, rule):
+    from module.database import Database
+
+    await add_history(plugin, rule, 26)
+    retry_id = await plugin.bridge.capture(rule, release(27))
+    await plugin.store.reserve(await plugin.store.candidate(retry_id))
+    await plugin.store.mark(retry_id, "retry")
+    async with Database() as db:
+        updated = await db.bangumi.search_id(rule.id)
+        updated.episode_offset = -25
+        updated.season_offset = 1
+        db.add(updated)
+        await db.commit()
+    await plugin.bridge.sync_history()
+    with sqlite3.connect(plugin.store.path) as db:
+        keys = [json.loads(r[0]) for r in db.execute("SELECT episode_key FROM delivered")]
+        reservations = [
+            json.loads(r[0]) for r in db.execute("SELECT episode_key FROM reservations")
+        ]
+    assert keys == [[rule.official_title, "episode", 2, 1]]
+    assert reservations == [[rule.official_title, "episode", 2, 2]]
+    assert (await plugin.store.candidate(retry_id))["status"] == "retry"
+    assert (await plugin.store.rules())[0]["state"] == "pending"
+    assert [e["episode"] for e in plugin.bridge.maintenance().history(rule.id)["episodes"]] == [1]
+    await plugin.bridge.sync_history()
+    with sqlite3.connect(plugin.store.path) as db:
+        assert db.execute("SELECT count(*) FROM delivered").fetchone()[0] == 1
+
+
+async def test_corner_bracket_group_has_selectable_subtitle_variants(plugin, rule):
+    from review_gate.versions import variants
+
+    titles = [
+        f"【今晚月色真美】[女友的朋友 / 彼女の友达 / Kanojo no Tomodachi][01v3][WebRip][1080P][AVC-8bit][AAC][{sub}][无修正]"
+        for sub in ("简日内嵌", "繁日内嵌")
+    ]
+    items = [{"name": name, **plugin.bridge.parsed_data(rule, name)} for name in titles]
+    result = variants(items)
+    assert len(result) == 2
+    assert {v["group"] for v in result} == {"今晚月色真美"}
+    assert {v["subtitle"] for v in result} == {"简日内嵌", "繁日内嵌"}
+    assert all(c["episode"] == 1 and c["revision"] == 3 for c in items)
+
+
+async def test_removed_rule_filter_rediscovers_existing_orphan_without_download(plugin, rule):
+    from module.database import Database
+
+    torrent = release(2, "AVC")
+    async with Database() as db:
+        stored = await db.bangumi.search_id(rule.id)
+        stored.filter = "AVC"
+        db.add(stored)
+        db.add(torrent)
+        await db.commit()
+    assert not (await plugin.bridge.repair_orphans())["repaired"]
+    async with Database() as db:
+        stored = await db.bangumi.search_id(rule.id)
+        stored.filter = ""
+        db.add(stored)
+        await db.commit()
+    assert (await plugin.bridge.repair_orphans())["repaired"] == [torrent.id]
+    assert (await plugin.store.rules())[0]["state"] == "pending"
+    assert len(await plugin.store.candidates(rule.id)) == 1
+    await plugin.bridge.replay()
+    plugin.test_send.assert_not_called()

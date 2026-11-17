@@ -44,6 +44,7 @@ class Bridge40:
         self.facade, self.original = DownloadClient, DownloadClient.add_torrent
         self.engine_class = RSSEngine
         self.original_filters = RSSEngine._apply_plugin_filters
+        self.original_match = RSSEngine.match_torrent
         if list(inspect.signature(self.original_filters).parameters) != [
             "self",
             "torrents",
@@ -98,6 +99,12 @@ class Bridge40:
             async def rss_set_rule(self, *args, **kwargs):
                 raise RuntimeError("审核下载器不允许创建绕过审核的 qB RSS 规则")
 
+        def reviewed_match(engine, torrent, rules):
+            selected = bridge.match_rule(torrent.name, rules)
+            return bridge.original_match(engine, torrent, [selected]) if selected else None
+
+        self.match_wrapper = reviewed_match
+        RSSEngine.match_torrent = reviewed_match
         self.client_factory = GuardedQb
 
         async def guarded_add(client, torrent, bangumi):
@@ -166,7 +173,93 @@ class Bridge40:
                 and self.engine_class._apply_plugin_filters is self.filters_wrapper
             ):
                 self.engine_class._apply_plugin_filters = self.original_filters
+            if (
+                getattr(self, "engine_class", None)
+                and self.engine_class.match_torrent is self.match_wrapper
+            ):
+                self.engine_class.match_torrent = self.original_match
         # Already-created GuardedQb instances retain active=False and refuse adds.
+
+    @staticmethod
+    def match_rule(name, rules):
+        """Preserve host title/type matching, prefer exact groups, never guess a season."""
+        from module.database.bangumi import (
+            _all_title_patterns,
+            _groups_are_similar,
+            _normalize_group_name,
+            match_bangumi_in_list,
+        )
+        from module.parser.analyser.selector import parse_configured_release_title
+
+        release = parse_configured_release_title(name)
+        title = release and (release.title_en or release.title_zh or release.title_jp)
+        ranked = []
+        for rule in rules:
+            if not match_bangumi_in_list(name, [rule]):
+                continue
+            length = max(len(p) for p in _all_title_patterns(rule) if p in name or p == title)
+            group = release.group if release else None
+            exact = bool(
+                group
+                and rule.group_name
+                and _normalize_group_name(group) == _normalize_group_name(rule.group_name)
+            )
+            rank = (length, int(exact), int(_groups_are_similar(group, rule.group_name)))
+            ranked.append((rank, rule))
+        if not ranked:
+            return None
+        best = max(rank for rank, _ in ranked)
+        finalists = [r for rank, r in ranked if rank == best]
+        if len({r.season for r in finalists}) > 1:
+            return None
+        return finalists[0]
+
+    async def repair_associations(self):
+        """Repair only unsent plugin candidates with an unambiguous exact-group match."""
+        from module.database import Database
+        from module.database.bangumi import _normalize_group_name
+        from module.parser.analyser.selector import parse_configured_release_title
+
+        async with self.lock:
+            known = {(c["rule_id"], c["url"]): c for c in await self.store.candidates()}
+            backup = None
+            async with Database() as db:
+                rules = await db.bangumi.search_all()
+                by_id = {r.id: r for r in rules if not r.deleted}
+                for torrent in await db.torrent.search_all():
+                    candidate = known.get((torrent.bangumi_id, torrent.url))
+                    old = by_id.get(torrent.bangumi_id)
+                    if (
+                        torrent.downloaded
+                        or not old
+                        or not candidate
+                        or candidate["status"] != "held"
+                    ):
+                        continue
+                    target = self.match_rule(torrent.name, rules)
+                    release = parse_configured_release_title(torrent.name)
+                    if (
+                        not target
+                        or target.id == old.id
+                        or target.archived
+                        or old.official_title != target.official_title
+                        or old.season == target.season
+                        or not release
+                        or not release.group
+                        or _normalize_group_name(release.group)
+                        != _normalize_group_name(target.group_name)
+                        or _normalize_group_name(release.group)
+                        == _normalize_group_name(old.group_name)
+                    ):
+                        continue
+                    if backup is None:
+                        backup = await asyncio.to_thread(self.maintenance().backup)
+                    await self.store.move_candidate(
+                        candidate, self.rule_data(target), self.parsed_data(target, torrent.name)
+                    )
+                    torrent.bangumi_id = target.id
+                    db.add(torrent)
+                await db.commit()
 
     @staticmethod
     def rule_data(rule):
@@ -214,6 +307,11 @@ class Bridge40:
             k: getattr(release, k, None)
             for k in ("group", "resolution", "source", "subtitle", "episode")
         }
+        # Retain an explicit leading release label that AB's known-group list
+        # cannot classify (e.g. 【今晚月色真美】[title]). Do not change episode parsing.
+        label = re.match(r"^【([^】]{1,80})】(?=\[)", name)
+        if release and not fields["group"] and label:
+            fields["group"] = label[1]
         fields["episode_key"] = None
         fields["revision"] = preference_revision(release) if release else 1
         bracket_revision = re.search(r"\[(\d{1,3}(?:\.5)?)v(\d+)\]", name, re.I)
@@ -254,6 +352,9 @@ class Bridge40:
     async def sync_history(self):
         from module.database import Database
 
+        from .policy import fingerprint
+
+        await self.repair_associations()
         async with Database() as db:
             rules = await db.bangumi.search_all()
             history = await db.torrent.search_all()
@@ -278,7 +379,15 @@ class Bridge40:
             updates = []
             for c in await self.store.candidates():
                 rule = by_id.get(c["rule_id"]) or SimpleNamespace(**stored[c["rule_id"]])
-                updates.append((c["id"], self.parsed_data(rule, c["name"])))
+                updates.append(
+                    (
+                        c["id"],
+                        {
+                            **self.parsed_data(rule, c["name"]),
+                            "rule_fingerprint": fingerprint(self.rule_data(rule)),
+                        },
+                    )
+                )
             await self.store.refresh_metadata(updates)
 
     async def health(self):
@@ -431,7 +540,7 @@ class Bridge40:
                         await db.session.delete(torrent)
                         merged.append({"removed": torrent.id, "kept": duplicate.id})
                         continue
-                    if ids is None and torrent.url not in known:
+                    if torrent.downloaded and torrent.url not in known:
                         continue
                     if any(re.search(p, torrent.name) for p in settings.rss_parser.filter):
                         continue
@@ -445,7 +554,7 @@ class Bridge40:
                             self.torrent_data(torrent),
                             self.parsed_data(rule, torrent.name),
                         )
-                    if ids is not None:
+                    if ids is not None or torrent.url not in known:
                         await self.store.hold(rule.id)
                     db.add(torrent)
                     fixed.append(torrent.id)
@@ -454,6 +563,7 @@ class Bridge40:
 
     async def replay(self):
         async with self.replay_lock:
+            await self.sync_history()
             await self.repair_orphans()
             return await self._replay()
 

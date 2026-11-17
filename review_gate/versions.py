@@ -17,15 +17,13 @@ def variants(candidates):
         terms.append(codec[0] if codec else None)
         terms = list(dict.fromkeys(t for t in terms if t))
         # Missing resolution is an explicit unknown, not a reason to hide a group.
-        if not candidate.get("group"):
-            continue
         key = hashlib.sha256(json.dumps([t.casefold() for t in terms]).encode()).hexdigest()[:20]
         entry = groups.setdefault(
             key,
             {
                 "id": key,
                 "include": terms,
-                "group": candidate["group"],
+                "group": candidate.get("group") or "字幕组未识别",
                 "resolution": candidate["resolution"],
                 "source": candidate.get("source"),
                 "subtitle": candidate.get("subtitle"),

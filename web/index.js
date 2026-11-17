@@ -17,7 +17,15 @@ button{cursor:pointer}button:disabled{opacity:.45;cursor:default}.primary{backgr
 .choices{display:grid;gap:8px;margin:16px 0}.choice{display:flex;align-items:start;gap:10px;padding:12px;border:1px solid #8884;border-radius:8px;cursor:pointer}.choice:has(input:checked){border-color:var(--ab-color-primary,#4f6bed);background:#6478ee0b}.choice input{margin-top:5px;accent-color:var(--ab-color-primary,#4f6bed)}.choice strong{display:block}.tags{display:flex;gap:6px;flex-wrap:wrap;margin-top:5px}.tag{padding:1px 7px;border-radius:4px;background:#8881;font-size:12px}
 label.field{display:grid;gap:6px;margin:12px 0}textarea{width:100%;min-height:72px}details{margin:16px 0}summary{cursor:pointer;color:var(--ab-color-text-secondary,#777)}.actions{margin-top:20px}.notice{padding:10px;background:#d99b1515;border-radius:6px}.error{color:#c14c38}#message{min-height:22px;margin-top:12px}.match{padding:8px 0;border-bottom:1px solid #8883;overflow-wrap:anywhere}#matches{max-height:260px;overflow:auto} [hidden]{display:none!important}
 `;
-const settingsCard = `:host{border:1px solid #8884;border-radius:12px;padding:20px;margin:12px 0;background:var(--ab-color-bg-container,transparent)}h3{font-size:16px;line-height:1.5;font-weight:600;margin:0 0 16px}p:last-child{margin-bottom:0}@media(max-width:600px){:host{padding:16px}}`;
+const settingsCard = `
+:host{font-family:var(--ab-font-family,system-ui)}
+.settings-panel{margin:0;border:1px solid var(--ab-color-border,#e2e8f0);border-radius:var(--ab-radius-md,8px);overflow:hidden;min-width:0;max-width:100%;transition:border-color var(--ab-transition-normal,200ms)}
+.settings-panel>summary{display:flex;align-items:center;justify-content:space-between;gap:8px;height:34px;padding:0 14px;list-style:none;color:var(--ab-color-text-secondary,#64748b);font-size:15px;font-weight:600;border-bottom:1px solid transparent;cursor:pointer}
+.settings-panel>summary::-webkit-details-marker{display:none}.settings-panel>summary:hover{color:var(--ab-color-text,#1e293b)}.settings-panel>summary:focus-visible{outline:2px solid var(--ab-color-primary);outline-offset:-2px}.settings-panel[open]>summary{border-bottom-color:var(--ab-color-border,#e2e8f0)}
+.settings-panel>summary svg{width:14px;height:14px;transition:transform var(--ab-transition-normal,200ms)}.settings-panel[open]>summary svg{transform:rotate(180deg)}
+.settings-body{background:var(--ab-color-surface,#fff);padding:12px 14px;font-size:14px;color:var(--ab-color-text,#1e293b);overflow-x:hidden}.settings-body p:last-child{margin-bottom:0}
+@media(pointer:coarse){.settings-panel>summary{height:44px}}`;
+const settingsFrame = (title, body) => `<style>${css}${settingsCard}</style><details class="settings-panel" open><summary><span>${title}</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"/></svg></summary><div class="settings-body">${body}</div></details>`;
 class Status extends HTMLElement {
   connectedCallback() {
     if (!this.shadowRoot) this.attachShadow({mode:'open'});
@@ -142,8 +150,35 @@ class Detail extends HTMLElement {
 class Settings extends HTMLElement {
   connectedCallback() {
     if (!this.shadowRoot) this.attachShadow({mode:'open'});
-    this.shadowRoot.innerHTML = `<style>${css}${settingsCard}</style><h3>订阅审核</h3><p id="status">正在读取…</p><p id="help" class="muted">启用后，新发现的番剧会先等待选择版本。下载器连接、目录和已有下载均保留。已有番剧也需确认一次版本。</p><button id="activate" class="primary" disabled>启用并刷新</button><p id="refresh-note" class="muted">请先保存其他设置；启用后会刷新 AB 页面。</p>`;
+    this.shadowRoot.innerHTML = settingsFrame('订阅审核', `<p id="status">正在读取…</p><p id="help" class="muted">启用后，新发现的番剧会先等待选择版本。下载器连接、目录和已有下载均保留。已有番剧也需确认一次版本。</p><button id="activate" class="primary" disabled>启用并刷新</button><p id="refresh-note" class="muted">请先保存其他设置；启用后会刷新 AB 页面。</p><hr style="border:0;border-top:1px solid var(--ab-color-border,#e2e8f0);margin:16px 0"><p id="update-status" role="status">正在读取更新状态…</p><div class="row"><button id="update-check">检查更新</button><button id="update-install" class="primary" hidden>更新插件</button><a id="release" target="_blank" rel="noopener noreferrer" hidden>版本说明</a></div><small>每 6 小时自动检查 GitHub 稳定版；点击更新后先备份、校验并重新加载。更新成功会刷新页面，请先保存其他设置。</small>`);
     this.$ = id => this.shadowRoot.getElementById(id);
+    this.renderUpdate = data => {
+      if (!this.isConnected) return;
+      this.updateData = data;
+      this.$('update-status').textContent = `当前 ${data.current} · ` + (data.error || (data.available ? `有新版 ${data.version}` : data.checked_at ? '已是最新稳定版' : '等待自动检查'));
+      this.$('update-install').hidden = !data.available;
+      this.$('update-install').textContent = `更新到 ${data.version || ''}`;
+      this.$('release').hidden = !data.url;
+      if (data.url) this.$('release').href = data.url;
+    };
+    this.$('update-check').onclick = async () => {
+      this.$('update-check').disabled = true;
+      try {this.renderUpdate(await this.host.api.post('update/check', {}));}
+      catch (e) {this.$('update-status').textContent = e.message || String(e);}
+      finally {this.$('update-check').disabled = false;}
+    };
+    this.$('update-install').onclick = async () => {
+      this.$('update-install').disabled = true; this.$('update-check').disabled = true;
+      this.$('update-status').textContent = '正在下载、备份并安装，请稍候…';
+      try {
+        await this.host.api.post('update/install', {version:this.updateData.version});
+        window.location.reload();
+      } catch (e) {
+        this.$('update-status').textContent = `${e.message || e}。如连接中断，请刷新页面确认当前版本后再操作。`;
+        this.$('update-install').disabled = false; this.$('update-check').disabled = false;
+      }
+    };
+    this.host.api.get('update').then(this.renderUpdate).catch(e => {this.$('update-status').textContent = e.message || String(e);});
     this.$('activate').onclick = async () => {
       this.$('activate').disabled = true;
       try {await this.host.api.post('activate', {}); invalidateRules(); window.location.reload();}
@@ -225,9 +260,9 @@ class History extends HTMLElement {
 class Maintenance extends HTMLElement {
   connectedCallback() {
     if (!this.shadowRoot) this.attachShadow({mode:'open'});
-    this.shadowRoot.innerHTML = `<style>${css}${settingsCard}</style><h3>下载历史维护</h3><p>查找现有番剧及已删除规则留下的下载历史。</p>
+    this.shadowRoot.innerHTML = settingsFrame('下载历史维护', `<p>查找现有番剧及已删除规则留下的下载历史。</p>
       <label class="field">番剧<input id="search" placeholder="输入番名筛选"><select id="rule"><option value="">选择番剧…</option></select></label>
-      <div id="history"></div><details><summary>检查未匹配种子</summary><button id="refresh">刷新</button><div id="orphans"></div><button id="repair">重新关联可识别记录</button><p id="message" role="status"></p></details>`;
+      <div id="history"></div><details><summary>检查未匹配种子</summary><button id="refresh">刷新</button><div id="orphans"></div><button id="repair">重新关联可识别记录</button><p id="message" role="status"></p></details>`);
     this.$ = id => this.shadowRoot.getElementById(id);
     this.$('search').oninput = () => this.options();
     this.$('rule').onchange = () => {

@@ -56,13 +56,18 @@ class Store:
     @staticmethod
     def _rule(db, rule):
         rid, fp = rule["id"], fingerprint(rule)
-        old = db.execute("SELECT fingerprint FROM rules WHERE id=?", (rid,)).fetchone()
+        old = db.execute("SELECT fingerprint,payload FROM rules WHERE id=?", (rid,)).fetchone()
         if old and old[0] != fp:
             db.execute(
                 "UPDATE rules SET state='pending',policy=NULL,revision=revision+1 WHERE id=?",
                 (rid,),
             )
-            db.execute("DELETE FROM candidates WHERE rule_id=?", (rid,))
+            previous = json.loads(old[1])
+            same_show = previous.get("official_title", "").casefold().strip() == rule.get(
+                "official_title", ""
+            ).casefold().strip() and previous.get("episode_type") == rule.get("episode_type")
+            if not same_show:
+                db.execute("DELETE FROM candidates WHERE rule_id=?", (rid,))
         db.execute(
             "INSERT INTO rules(id,fingerprint,payload) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET fingerprint=excluded.fingerprint,payload=excluded.payload",
             (rid, fp, json.dumps(rule, ensure_ascii=False)),
@@ -91,6 +96,26 @@ class Store:
     async def capture(self, rule, torrent, parsed):
         return await self.call(self._capture, rule, torrent, parsed)
 
+    async def move_candidate(self, candidate, rule, parsed):
+        def move(db):
+            # Uncertain dispatch must stay attached to the original rule.
+            if db.execute("SELECT 1 FROM reservations WHERE url=?", (candidate["url"],)).fetchone():
+                raise ValueError("候选有待确认投递，不能自动调整关联")
+            cid = self._capture(db, rule, candidate, parsed)
+            db.execute(
+                "UPDATE candidates SET first_seen=MIN(first_seen,?) WHERE id=?",
+                (candidate["first_seen"], cid),
+            )
+            db.execute("DELETE FROM candidates WHERE id=? AND status='held'", (candidate["id"],))
+            if not db.execute(
+                "SELECT 1 FROM delivered WHERE episode_key=?", (parsed.get("episode_key"),)
+            ).fetchone():
+                db.execute(
+                    "UPDATE rules SET state='pending',revision=revision+1 WHERE id=?", (rule["id"],)
+                )
+
+        await self.call(move)
+
     async def import_history(self, rules, entries):
         """One atomic commit avoids hundreds of NAS fsyncs during plugin setup."""
 
@@ -113,6 +138,7 @@ class Store:
 
     async def refresh_metadata(self, updates):
         def update(db):
+            remapped = {}
             for cid, parsed in updates:
                 row = db.execute("SELECT * FROM candidates WHERE id=?", (cid,)).fetchone()
                 if not row:
@@ -122,11 +148,42 @@ class Store:
                     "UPDATE candidates SET payload=? WHERE id=?",
                     (json.dumps(payload, ensure_ascii=False), cid),
                 )
-                if row["status"] in ("sent", "delivered") and parsed.get("episode_key"):
+                key = parsed.get("episode_key")
+                if key:
+                    remapped.setdefault(row["url"], set()).add(key)
+            # Dedup records retain the source URL. Rewrite only identities whose
+            # source is still known; unrelated or unparseable history is preserved.
+            delivered = list(db.execute("SELECT * FROM delivered"))
+            for row in delivered:
+                keys = remapped.get(row["url"])
+                if keys and row["episode_key"] not in keys:
                     db.execute(
-                        "INSERT OR IGNORE INTO delivered VALUES(?,?)",
-                        (parsed["episode_key"], row["url"]),
+                        "DELETE FROM delivered WHERE episode_key=? AND url=?",
+                        (row["episode_key"], row["url"]),
                     )
+                    for key in keys:
+                        db.execute("INSERT OR IGNORE INTO delivered VALUES(?,?)", (key, row["url"]))
+            # Preserve uncertain-delivery reservations while moving their identity.
+            for row in list(db.execute("SELECT * FROM reservations")):
+                keys = remapped.get(row["url"])
+                if keys and len(keys) == 1 and row["episode_key"] not in keys:
+                    key = next(iter(keys))
+                    existing = db.execute(
+                        "SELECT url FROM reservations WHERE episode_key=?", (key,)
+                    ).fetchone()
+                    if existing is None or existing[0] == row["url"]:
+                        db.execute(
+                            "INSERT OR IGNORE INTO reservations VALUES(?,?)", (key, row["url"])
+                        )
+                        db.execute(
+                            "DELETE FROM reservations WHERE episode_key=?", (row["episode_key"],)
+                        )
+            for row in db.execute(
+                "SELECT payload,url,status FROM candidates WHERE status IN ('sent','delivered')"
+            ):
+                key = json.loads(row["payload"]).get("episode_key")
+                if key:
+                    db.execute("INSERT OR IGNORE INTO delivered VALUES(?,?)", (key, row["url"]))
 
         await self.call(update)
 
