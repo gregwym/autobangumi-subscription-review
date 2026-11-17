@@ -13,6 +13,7 @@ def build(root):
     files = [root / "plugin.toml", root / "README.md", root / "LICENSE"]
     files += sorted((root / "review_gate").glob("*.py"))
     files += [root / "web/index.js"]
+    files += [root / "tools/configure.py"]
     with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
         for path in sorted(files):
             info = zipfile.ZipInfo(path.relative_to(root).as_posix(), (2020, 1, 1, 0, 0, 0))
