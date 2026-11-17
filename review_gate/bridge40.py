@@ -206,18 +206,17 @@ class Bridge40:
             history = await db.torrent.search_all()
         by_id = {r.id: r for r in rules if not r.deleted}
         async with self.lock:
-            for rule in by_id.values():
-                await self.store.register(self.rule_data(rule))
-            for torrent in history:
-                rule = by_id.get(torrent.bangumi_id)
-                if rule and torrent.downloaded:
-                    await self.store.seed(
-                        self.rule_data(rule),
-                        self.torrent_data(torrent),
-                        self.parsed_data(rule, torrent.name),
-                    )
-                elif rule:
-                    await self.capture(rule, torrent)
+            entries = [
+                (
+                    self.rule_data(by_id[t.bangumi_id]),
+                    self.torrent_data(t),
+                    self.parsed_data(by_id[t.bangumi_id], t.name),
+                    t.downloaded,
+                )
+                for t in history
+                if t.bangumi_id in by_id
+            ]
+            await self.store.import_history([self.rule_data(r) for r in by_id.values()], entries)
 
     async def health(self):
         from module.conf import VERSION, settings

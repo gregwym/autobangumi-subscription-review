@@ -69,6 +69,10 @@ python3 tools/configure.py /path/to/config/config.json --instance default --appl
 - 不确定的下载失败只重试原候选，不自动切换同集其他版本。当前没有强制覆盖 / 清除单集占用按钮。
 - 兼容测试使用 AB 的真实解析、数据库、RSS 引擎、插件加载器和下载门面；外部 qB 网络添加被替身替换。实际 NAS 上的下载和后续整理仍需试用验收。
 
+## NAS 初始化性能
+
+0.2.1 将历史导入合并为单个数据库事务，并明确关闭 SQLite 连接。避免机械硬盘上逐条提交超过 AB 的 30 秒插件启动时限；历史导入完成前不会提供可用的审核下载器。
+
 ## 开发与测试
 
 运行时不需要额外 pip 包。开发测试使用官方 AB 的依赖和 Python 3.14。
@@ -81,7 +85,7 @@ PYTHONPATH=/tmp/ab-4.0/backend/src /tmp/ab-4.0/backend/.venv/bin/ab-plugin valid
 python3 tools/build.py
 ```
 
-`dist/subscription-review-0.2.0.zip` 是允许列表打包的安装包，不含测试状态、凭据、缓存或源码 checkout。CI 针对同一个官方 commit 验证。
+`dist/subscription-review-0.2.1.zip` 是允许列表打包的安装包，不含测试状态、凭据、缓存或源码 checkout。CI 针对同一个官方 commit 验证。
 
 ## 后续上游方向
 

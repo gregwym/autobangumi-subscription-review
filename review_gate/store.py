@@ -6,6 +6,7 @@ import asyncio
 import json
 import sqlite3
 import time
+from contextlib import closing
 from pathlib import Path
 
 from .policy import Policy, candidate_id, fingerprint
@@ -16,7 +17,7 @@ class Store:
         self.path = path
 
     def _run(self, action, *args):
-        with sqlite3.connect(self.path, timeout=10) as db:
+        with closing(sqlite3.connect(self.path, timeout=10)) as db, db:
             db.row_factory = sqlite3.Row
             db.execute("PRAGMA journal_mode=WAL")
             db.execute("PRAGMA foreign_keys=ON")
@@ -69,30 +70,45 @@ class Store:
     async def register(self, rule):
         await self.call(self._rule, rule)
 
-    async def capture(self, rule, torrent, parsed):
-        def add(db):
-            self._rule(db, rule)
-            cid = candidate_id(rule["id"], torrent["url"])
-            data = {
-                **torrent,
-                **parsed,
-                "id": cid,
-                "rule_id": rule["id"],
-                "rule_fingerprint": fingerprint(rule),
-            }
-            db.execute(
-                "INSERT INTO candidates(id,rule_id,url,payload,first_seen) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",
-                (
-                    cid,
-                    rule["id"],
-                    torrent["url"],
-                    json.dumps(data, ensure_ascii=False),
-                    time.time(),
-                ),
-            )
-            return cid
+    @classmethod
+    def _capture(cls, db, rule, torrent, parsed):
+        cls._rule(db, rule)
+        cid = candidate_id(rule["id"], torrent["url"])
+        data = {
+            **torrent,
+            **parsed,
+            "id": cid,
+            "rule_id": rule["id"],
+            "rule_fingerprint": fingerprint(rule),
+        }
+        db.execute(
+            "INSERT INTO candidates(id,rule_id,url,payload,first_seen) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",
+            (cid, rule["id"], torrent["url"], json.dumps(data, ensure_ascii=False), time.time()),
+        )
+        return cid
 
-        return await self.call(add)
+    async def capture(self, rule, torrent, parsed):
+        return await self.call(self._capture, rule, torrent, parsed)
+
+    async def import_history(self, rules, entries):
+        """One atomic commit avoids hundreds of NAS fsyncs during plugin setup."""
+
+        def merge(db):
+            for rule in rules:
+                self._rule(db, rule)
+            for rule, torrent, parsed, downloaded in entries:
+                cid = self._capture(db, rule, torrent, parsed)
+                if downloaded:
+                    db.execute(
+                        "UPDATE candidates SET status='delivered',error=NULL WHERE id=?", (cid,)
+                    )
+                    if parsed.get("episode_key"):
+                        db.execute(
+                            "INSERT OR IGNORE INTO delivered VALUES(?,?)",
+                            (parsed["episode_key"], torrent["url"]),
+                        )
+
+        await self.call(merge)
 
     @staticmethod
     def _unpack(row):

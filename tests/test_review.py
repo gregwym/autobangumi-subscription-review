@@ -283,3 +283,33 @@ async def test_replayed_candidate_keeps_approval_after_plugin_restart(plugin, ru
         assert plugin.test_send.call_count == 1
     finally:
         await replacement.teardown()
+
+
+async def test_history_batch_is_atomic_and_deduplicates_existing_downloads(plugin, rule):
+    from review_gate.policy import Policy
+
+    r = plugin.bridge.rule_data(rule)
+    entries = []
+    for ep in range(1, 123):
+        t = release(ep)
+        entries.append(
+            (r, plugin.bridge.torrent_data(t), plugin.bridge.parsed_data(rule, t.name), ep < 100)
+        )
+    await plugin.store.import_history([r], entries)
+    assert len(await plugin.store.candidates(rule.id)) == 122
+    await plugin.store.import_history([r], entries)
+    assert len(await plugin.store.candidates(rule.id)) == 122
+    candidate = next(c for c in await plugin.store.candidates(rule.id) if c["episode"] == 1)
+    assert candidate["status"] == "delivered"
+    assert (
+        await plugin.store.decision(candidate, override=Policy(include=["HEVC"], mode="backlog"))
+        == "已投递"
+    )
+    # A failed batch must not leave a partially imported new rule or candidate.
+    other = {**r, "id": rule.id + 1000, "official_title": "Atomic failure"}
+    invalid = (other, {"url": "invalid"}, {}, False)
+    with pytest.raises(TypeError):
+        await plugin.store.import_history(
+            [other], [(*entries[0][:3], True), (other, {"url": object()}, {}, False), invalid]
+        )
+    assert all(x["id"] != other["id"] for x in await plugin.store.rules())
