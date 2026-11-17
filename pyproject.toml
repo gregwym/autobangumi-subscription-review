@@ -1,0 +1,18 @@
+[project]
+name = "autobangumi-subscription-review"
+version = "0.1.0"
+description = "Persistent subscription approval queue for AutoBangumi 4.0.0"
+requires-python = ">=3.14"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py314"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501"]

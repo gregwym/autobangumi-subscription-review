@@ -1,0 +1,36 @@
+name: AB 4.0 compatibility
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: plugin
+      - uses: actions/checkout@v4
+        with:
+          repository: EstrellaXD/Auto_Bangumi
+          ref: bc23984ae4a6d388c0b8381e48f6aa9b60e338ba
+          path: ab
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.14'
+      - run: uv sync --project ab/backend --frozen
+      - name: Lint
+        run: ab/backend/.venv/bin/ruff check plugin && ab/backend/.venv/bin/ruff format --check plugin
+      - name: Integration tests
+        working-directory: plugin
+        env:
+          AB_SOURCE: ${{ github.workspace }}/ab
+        run: ../ab/backend/.venv/bin/python -m pytest -q
+      - name: Validate and package
+        working-directory: plugin
+        env:
+          PYTHONPATH: ${{ github.workspace }}/ab/backend/src
+        run: |
+          ../ab/backend/.venv/bin/ab-plugin validate .
+          python tools/build.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: subscription-review
+          path: plugin/dist/*
