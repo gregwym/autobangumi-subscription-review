@@ -10,6 +10,7 @@ from contextlib import closing
 from pathlib import Path
 
 from .policy import Policy, candidate_id, fingerprint
+from .versions import variants
 
 
 class Store:
@@ -110,6 +111,25 @@ class Store:
 
         await self.call(merge)
 
+    async def refresh_metadata(self, updates):
+        def update(db):
+            for cid, parsed in updates:
+                row = db.execute("SELECT * FROM candidates WHERE id=?", (cid,)).fetchone()
+                if not row:
+                    continue
+                payload = {**json.loads(row["payload"]), **parsed}
+                db.execute(
+                    "UPDATE candidates SET payload=? WHERE id=?",
+                    (json.dumps(payload, ensure_ascii=False), cid),
+                )
+                if row["status"] in ("sent", "delivered") and parsed.get("episode_key"):
+                    db.execute(
+                        "INSERT OR IGNORE INTO delivered VALUES(?,?)",
+                        (parsed["episode_key"], row["url"]),
+                    )
+
+        await self.call(update)
+
     @staticmethod
     def _unpack(row):
         return {
@@ -200,7 +220,27 @@ class Store:
             if override is None and (not row or row["state"] != "approved"):
                 return "等待版本审核"
             policy = override or Policy(**json.loads(row["policy"]))
-            return policy.reason(candidate)
+            reason = policy.reason(candidate)
+            if reason:
+                return reason
+            version = variants([candidate])
+            if version:
+                for other_row in db.execute(
+                    "SELECT * FROM candidates WHERE rule_id=?", (candidate["rule_id"],)
+                ):
+                    other = self._unpack(other_row)
+                    if other.get("episode_key") != candidate.get("episode_key") or policy.reason(
+                        other
+                    ):
+                        continue
+                    other_version = variants([other])
+                    if (
+                        other_version
+                        and other_version[0]["id"] == version[0]["id"]
+                        and other.get("revision", 1) > candidate.get("revision", 1)
+                    ):
+                        return f"同版本已有 v{other['revision']} 修订，跳过旧版"
+            return None
 
         return await self.call(read)
 

@@ -23,7 +23,7 @@ def test_version_identity_does_not_match_other_group_or_missing_codec():
     assert policy.reason(item) is None
     assert policy.reason({**item, "group": "Group Extra"})
     assert policy.reason({**item, "name": "[Group] Show 02 1080p"})
-    assert not variants([{**item, "resolution": None}])
+    assert variants([{**item, "resolution": None}])[0]["resolution"] is None
 
 
 async def test_activate_preserves_config_and_reloads_outside_guard(plugin, tmp_path, monkeypatch):

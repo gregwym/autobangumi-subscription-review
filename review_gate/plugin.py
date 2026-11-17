@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import secrets
@@ -22,6 +23,15 @@ class ReviewRequest(BaseModel):
     exclude: list[str] = Field(default_factory=list, max_length=32)
     mode: str = "future"
     from_episode: float = Field(default=1, ge=0, le=100000)
+    unfiltered: bool = False
+
+
+class HistoryRequest(BaseModel):
+    episodes: list[float] = Field(min_length=1, max_length=2000)
+
+
+class OrphanRequest(BaseModel):
+    ids: list[int] = Field(min_length=1, max_length=2000)
 
 
 class ApprovalRequest(BaseModel):
@@ -36,6 +46,8 @@ def snapshot(revision, candidates):
 class SubscriptionReview(Plugin):
     async def setup(self):
         self.previews = {}
+        self.history_previews = {}
+        self.maintenance_lock = asyncio.Lock()
         self.store = Store(self.ctx.data_dir / "review.sqlite3")
         await self.store.init()
         self.bridge = Bridge40(self.store, self.ctx.log)
@@ -112,6 +124,8 @@ class SubscriptionReview(Plugin):
                 rule = await find_rule(rid)
                 items = await self.store.candidates(rid)
                 data = body.model_dump(exclude={"version_id"})
+                if body.unfiltered and (body.version_id or body.include or body.exclude):
+                    raise HTTPException(422, "不过滤版本不能同时设置版本或关键词")
                 if body.version_id:
                     selected = next(
                         (v for v in variants(items) if v["id"] == body.version_id), None
@@ -176,6 +190,65 @@ class SubscriptionReview(Plugin):
                 await find_rule(rid)
                 await self.store.hold(rid)
             return {"held": True}
+
+        @router.get("/maintenance/rules")
+        async def maintenance_rules():
+            return await asyncio.to_thread(self.bridge.maintenance().rules)
+
+        @router.get("/rules/{rid}/history")
+        async def history(rid: int):
+            try:
+                return await asyncio.to_thread(self.bridge.maintenance().history, rid)
+            except ValueError as e:
+                raise HTTPException(409, str(e)) from e
+
+        @router.post("/rules/{rid}/history/preview")
+        async def history_preview(rid: int, body: HistoryRequest):
+            try:
+                async with self.bridge.lock:
+                    receipt = await asyncio.to_thread(
+                        self.bridge.maintenance().preview, rid, body.episodes
+                    )
+                now = time.time()
+                self.history_previews = {
+                    k: v for k, v in self.history_previews.items() if v["expires"] > now
+                }
+                if len(self.history_previews) >= 100:
+                    self.history_previews.pop(next(iter(self.history_previews)))
+                token = secrets.token_urlsafe(32)
+                self.history_previews[token] = {**receipt, "expires": now + 600}
+                return {"preview_token": token, **receipt["summary"]}
+            except ValueError as e:
+                raise HTTPException(409, str(e)) from e
+
+        @router.post("/rules/{rid}/history/clear")
+        async def history_clear(rid: int, body: ApprovalRequest, request: Request):
+            async with self.maintenance_lock:
+                receipt = self.history_previews.pop(body.preview_token, None)
+                if not receipt or receipt["rid"] != rid or receipt["expires"] < time.time():
+                    raise HTTPException(409, "预览已失效，请重新预览")
+                context = request.app.state.ctx
+                running = context.is_running
+                # Stop outside bridge locks so scheduled tasks can finish/cancel.
+                if running:
+                    await context.stop()
+                try:
+                    async with self.bridge.replay_lock, self.bridge.lock:
+                        return await asyncio.to_thread(self.bridge.maintenance().clear, receipt)
+                except ValueError as e:
+                    raise HTTPException(409, str(e)) from e
+                finally:
+                    if running:
+                        await context.start_tasks()
+
+        @router.get("/maintenance/orphans")
+        async def orphans():
+            return await self.bridge.orphan_records()
+
+        @router.post("/maintenance/orphans/repair")
+        async def repair_orphans(body: OrphanRequest):
+            async with self.bridge.replay_lock:
+                return await self.bridge.repair_orphans(set(body.ids))
 
         @router.post("/sync")
         async def sync():

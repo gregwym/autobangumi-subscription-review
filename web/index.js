@@ -20,7 +20,7 @@ label.field{display:grid;gap:6px;margin:12px 0}textarea{width:100%;min-height:72
 class Status extends HTMLElement {
   connectedCallback() {
     if (!this.shadowRoot) this.attachShadow({mode:'open'});
-    this.shadowRoot.innerHTML = `<style>${css}:host{text-align:center;font-size:12px;padding:5px}.pending{color:#aa7a22}.approved{color:#278456}</style><span></span>`;
+    this.shadowRoot.innerHTML = `<style>${css}:host{text-align:center;padding:6px 4px}span{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:999px;font-size:11px;font-weight:600;line-height:1.4;border:1px solid transparent}span:before{content:'';width:5px;height:5px;border-radius:50%;background:currentColor;flex:none}.pending{color:#a66a12;background:#d99b1518;border-color:#d99b1533}.approved{color:#248464;background:#2da77e16;border-color:#2da77e30}@media(prefers-color-scheme:dark){.pending{color:#e5b657;background:#d99b1520}.approved{color:#72cfae;background:#2da77e20}}</style><span></span>`;
     this.update = async () => {
       try {
         const data = await rules(this.host);
@@ -42,7 +42,7 @@ class Detail extends HTMLElement {
     this.shadowRoot.innerHTML = `<style>${css}</style>
       <p class="muted">选择一次下载版本，后续新集自动追番。</p>
       <div id="notice" class="notice" hidden></div><div id="choices" class="choices"></div>
-      <label class="field">开始方式<select id="mode"><option value="future">只追后续新发布</option><option value="backlog">补下已有集数</option></select></label>
+      <label class="field">开始方式<select id="mode"><option value="future">只追后续新发布</option><option value="backlog">补下已发现的缺集</option></select></label>
       <details><summary>高级设置</summary>
         <label class="field">从第几集开始<input id="episode" type="number" min="0" max="100000" step="0.5" value="1"></label>
         <label><input id="custom" type="checkbox"> 自定义版本条件</label>
@@ -78,13 +78,19 @@ class Detail extends HTMLElement {
       this.$('notice').hidden = data.health.ready;
       this.$('notice').textContent = '请先在 AB 设置 → 订阅审核中启用保护，再开启聚合 RSS。';
       this.$('choices').replaceChildren();
+      const any = document.createElement('label'); any.className = 'choice';
+      const anyRadio = document.createElement('input'); anyRadio.type = 'radio'; anyRadio.name = 'version';
+      const anyText = document.createElement('div'); anyText.innerHTML = '<strong>不过滤版本，沿用 AB 规则</strong><small>不限定字幕组、清晰度、字幕或编码；同集只下载一次，仍遵守 AB 的过滤设置。</small>';
+      if (p.unfiltered) {anyRadio.checked = true; this.selected = '__any';}
+      anyRadio.onchange = () => {this.selected = '__any'; this.$('include').value = ''; this.$('exclude').value = ''; this.$('custom').checked = false; this.$('include-field').hidden = true; this.schedule();};
+      any.append(anyRadio, anyText); this.$('choices').append(any);
       for (const v of data.versions) {
         const label = document.createElement('label'); label.className = 'choice';
         const radio = document.createElement('input'); radio.type = 'radio'; radio.name = 'version'; radio.value = v.id;
         const body = document.createElement('div'); const name = document.createElement('strong'); name.textContent = v.group; body.append(name);
         const tags = document.createElement('div'); tags.className = 'tags';
-        for (const text of [v.resolution,v.source,v.codec,v.subtitle].filter(Boolean)) {const tag = document.createElement('span'); tag.className = 'tag'; tag.textContent = text; tags.append(tag);}
-        body.append(tags); const count = document.createElement('small'); count.textContent = `已发现 ${v.count} 集`; body.append(count); body.title = v.example;
+        for (const text of [v.resolution || '清晰度未标注',v.source,v.codec,v.subtitle].filter(Boolean)) {const tag = document.createElement('span'); tag.className = 'tag'; tag.textContent = text; tags.append(tag);}
+        body.append(tags); const count = document.createElement('small'); count.textContent = `已发现 ${v.count} 集：${v.episodes.join("、")}`; body.append(count); body.title = v.example;
         const same = p.version_id ? p.version_id === v.id : p.include?.length === v.include.length && p.include.every(t => v.include.some(x => x.toLowerCase() === t.toLowerCase()));
         if (same) {radio.checked = true; this.selected = v.id;}
         radio.onchange = () => {this.selected = v.id; this.$('include').value = v.include.join('\n'); this.$('custom').checked = false; this.$('include-field').hidden = true; this.schedule();};
@@ -99,6 +105,7 @@ class Detail extends HTMLElement {
   }
   schedule() {
     this.invalidate(); clearTimeout(this.timer);
+    this.$('exclude').disabled = this.selected === '__any' && !this.$('custom').checked;
     this.$('message').className = ''; this.$('message').textContent = '正在检查匹配集数…';
     this.timer = setTimeout(() => this.preview(), 250);
   }
@@ -107,6 +114,7 @@ class Detail extends HTMLElement {
     const terms = id => this.$(id).value.split('\n').map(s => s.trim()).filter(Boolean);
     const body = {exclude:terms('exclude'), mode:this.$('mode').value, from_episode:Number(this.$('episode').value)};
     if (this.$('custom').checked) body.include = terms('include');
+    else if (this.selected === '__any') {body.unfiltered = true; body.exclude = [];}
     else if (this.selected) body.version_id = this.selected;
     else {this.$('message').textContent = '请先选择一个版本。'; return;}
     try {
@@ -114,7 +122,7 @@ class Detail extends HTMLElement {
       if (!this.isConnected || serial !== this.serial) return;
       this.token = result.preview_token;
       this.$('approve').disabled = !this.data.health.ready || this.busy;
-      this.$('message').textContent = body.mode === 'future' ? '仅下载确认后新发布的匹配集数。已有候选不会补下。' : `当前将补下 ${result.will_download} 集，已有下载会跳过。`;
+      this.$('message').textContent = body.mode === 'future' ? '仅下载确认后新发布的匹配集数。已有候选不会补下。' : `已发现的资源中将补下 ${result.will_download} 集；已下载的集数（含其他字幕组）会跳过。`;
       this.$('matches').replaceChildren();
       for (const item of result.items.slice(0,500)) {const row = document.createElement('div'); row.className = 'match'; row.textContent = `${item.name} · ${item.reason || '将下载'}`; this.$('matches').append(row);}
     } catch (e) {if (serial === this.serial) this.error(e);}
@@ -152,3 +160,105 @@ class Settings extends HTMLElement {
 customElements.define('ab-plugin-subscription-review-status', Status);
 customElements.define('ab-plugin-subscription-review-detail', Detail);
 customElements.define('ab-plugin-subscription-review-settings', Settings);
+
+class History extends HTMLElement {
+  connectedCallback() {
+    if (!this.shadowRoot) this.attachShadow({mode:'open'});
+    this.shadowRoot.innerHTML = `<style>${css}</style>
+      <p>清除按集数保存的下载历史，让已下载过的集数可以重新选版本补下。支持清理已删除规则留下的记录。</p>
+      <p class="notice">清除会同时处理 AB 历史和插件去重记录，并暂停同番相关规则等待重新审核。媒体文件和 qB 任务会保留。</p>
+      <div class="row"><button id="all">全选 / 取消全选</button><button id="refresh">刷新历史</button></div>
+      <div id="episodes" class="choices"></div>
+      <div class="row"><button id="preview">预览清除所选历史</button><button id="clear" class="primary" hidden>确认清除并备份</button></div>
+      <p id="message" role="status"></p>`;
+    this.$ = id => this.shadowRoot.getElementById(id);
+    this.rid = Number(this.context?.bangumiId);
+    this.$('refresh').onclick = () => this.load();
+    this.$('all').onclick = () => {const inputs = [...this.$('episodes').querySelectorAll('input')]; const checked = !inputs.every(i => i.checked); inputs.forEach(i => {i.checked = checked;}); this.invalidate();};
+    this.$('preview').onclick = () => this.preview();
+    this.$('clear').onclick = () => this.clear();
+    this.load();
+  }
+  invalidate() {this.token = null; this.$('clear').hidden = true; this.$('message').textContent = '';}
+  async load() {
+    this.invalidate(); this.$('preview').disabled = true;
+    try {
+      const data = await this.host.api.get(`rules/${this.rid}/history`);
+      if (!this.isConnected) return;
+      this.$('episodes').replaceChildren();
+      for (const ep of data.episodes) {
+        const label = document.createElement('label'); label.className = 'choice';
+        const input = document.createElement('input'); input.type = 'checkbox'; input.value = ep.episode; input.onchange = () => this.invalidate();
+        const content = document.createElement('div'); const title = document.createElement('strong'); title.textContent = `第 ${ep.episode} 集`;
+        const details = document.createElement('small'); details.textContent = ep.names.join('\n') || '仅剩插件去重记录'; details.style.whiteSpace = 'pre-wrap';
+        content.append(title, details); label.append(input, content); this.$('episodes').append(label);
+      }
+      this.$('preview').disabled = !data.episodes.length;
+      this.$('message').textContent = data.episodes.length ? `共 ${data.episodes.length} 集有下载历史。包括同番其他字幕组和已删除规则的记录。` : '没有已下载历史。';
+    } catch (e) {this.$('message').textContent = e.message || String(e);}
+  }
+  async preview() {
+    const episodes = [...this.$('episodes').querySelectorAll('input:checked')].map(i => Number(i.value));
+    if (!episodes.length) {this.$('message').textContent = '请先勾选集数。'; return;}
+    this.$('preview').disabled = true;
+    try {
+      const data = await this.host.api.post(`rules/${this.rid}/history/preview`, {episodes});
+      this.token = data.preview_token; this.$('clear').hidden = false;
+      this.$('message').textContent = `将清除「${data.title}」第 ${data.episodes.map(e => e.episode).join('、')} 集的历史，并将 ${data.related_rules.length} 条相关规则转为待审核。确认后先备份，再清除；随后到“下载版本”选择版本和“补下已发现的缺集”。`;
+    } catch (e) {this.$('message').textContent = e.message || String(e);}
+    finally {this.$('preview').disabled = false;}
+  }
+  async clear() {
+    if (!this.token || this.busy) return;
+    this.busy = true; this.$('clear').disabled = true; this.$('preview').disabled = true;
+    try {
+      const result = await this.host.api.post(`rules/${this.rid}/history/clear`, {preview_token:this.token});
+      invalidateRules(); await this.load();
+      this.$('message').textContent = `已清除 ${result.cleared_episodes.length} 集历史。请重新选择下载版本。备份：${result.backup}`;
+      this.host.toast('已清除历史，相关番剧等待重新选版本', 'info');
+    } catch (e) {this.invalidate(); this.$('message').textContent = e.message || String(e);}
+    finally {this.busy = false; this.$('clear').disabled = false; this.$('preview').disabled = false;}
+  }
+}
+class Maintenance extends HTMLElement {
+  connectedCallback() {
+    if (!this.shadowRoot) this.attachShadow({mode:'open'});
+    this.shadowRoot.innerHTML = `<style>${css}</style><p>查找现有番剧及已删除规则留下的下载历史。</p>
+      <label class="field">番剧<input id="search" placeholder="输入番名筛选"><select id="rule"><option value="">选择番剧…</option></select></label>
+      <div id="history"></div><details><summary>检查未匹配种子</summary><button id="refresh">刷新</button><div id="orphans"></div><button id="repair">重新关联可识别记录</button><p id="message" role="status"></p></details>`;
+    this.$ = id => this.shadowRoot.getElementById(id);
+    this.$('search').oninput = () => this.options();
+    this.$('rule').onchange = () => {
+      this.$('history').replaceChildren(); const rid = Number(this.$('rule').value); if (!rid) return;
+      const el = document.createElement('ab-plugin-subscription-review-history'); el.host = this.host; el.context = {bangumiId:rid}; this.$('history').append(el);
+    };
+    this.$('refresh').onclick = () => this.orphans();
+    this.$('repair').onclick = async () => {
+      const ids = (this.orphanRows || []).filter(r => r.rule_id).map(r => r.id);
+      if (!ids.length) return;
+      this.$('repair').disabled = true;
+      try {const result = await this.host.api.post('maintenance/orphans/repair', {ids}); invalidateRules(); await this.orphans(); this.$('message').textContent = `已关联 ${result.repaired.length} 条，合并 ${result.merged.length} 条重复记录。相关番剧先等待选版本。`;}
+      catch(e) {this.$('message').textContent = e.message || String(e);}
+      finally {this.$('repair').disabled = false;}
+    };
+    this.host.api.get('maintenance/rules').then(data => {this.rows = data; this.options();}).catch(e => {this.$('message').textContent = e.message;});
+    this.orphans();
+  }
+  options() {
+    this.$('rule').replaceChildren(new Option('选择番剧…', ''));
+    const query = this.$('search').value.toLowerCase();
+    for (const r of this.rows || []) if (r.title.toLowerCase().includes(query)) {
+      this.$('rule').append(new Option(`${r.title} · 第 ${r.season} 季 · ${r.group || '未标注组'} · #${r.id}${r.missing || r.deleted ? '（已删除规则）' : ''}`, r.id));
+    }
+  }
+  async orphans() {
+    try {
+      this.orphanRows = await this.host.api.get('maintenance/orphans'); this.$('orphans').replaceChildren();
+      for (const row of this.orphanRows) {const el = document.createElement('div'); el.className = 'match'; el.textContent = `#${row.id} ${row.name} · ${row.reason}${row.rule_title ? ' → ' + row.rule_title : ''}`; this.$('orphans').append(el);}
+      this.$('message').textContent = this.orphanRows.length ? `共 ${this.orphanRows.length} 条未匹配记录。重新关联会暂停涉及番剧，等待确认版本。` : '没有未匹配种子。';
+      this.$('repair').disabled = !this.orphanRows.some(r => r.rule_id);
+    } catch(e) {this.$('message').textContent = e.message || String(e);}
+  }
+}
+customElements.define('ab-plugin-subscription-review-history', History);
+customElements.define('ab-plugin-subscription-review-maintenance', Maintenance);

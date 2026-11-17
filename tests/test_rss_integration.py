@@ -56,7 +56,7 @@ async def test_aggregate_discovery_orphans_approval_then_new_episode(plugin, mon
     async with Database() as db:
         rules = await db.bangumi.search_all()
         assert len(rules) == 2
-        assert len(await db.torrent.search_orphans()) == 3
+        assert len(await db.torrent.search_orphans()) == 0
     chosen = next(r for r in rules if r.title_raw == "Example Show")
     await approve(plugin, chosen)
     await plugin.bridge.replay()
@@ -120,3 +120,27 @@ async def test_real_plugin_loader_imports_package(tmp_path):
     cls = candidate.load()
     assert cls.__name__ == "SubscriptionReview"
     candidate.unload()
+
+
+async def test_rss_batch_v1_before_v2_still_downloads_only_v2(plugin, rule, monkeypatch):
+    from module.database import Database
+    from module.downloader import DownloaderPool
+    from module.models import RSSItem
+    from module.rss import RSSEngine
+
+    install_hook(plugin)
+    await approve(plugin, rule)
+    async with Database() as db:
+        rss = RSSItem(name="RSS", url="https://example.test/rss")
+        db.add(rss)
+        await db.commit()
+    v1 = release(1)
+    v2 = release(1, url="magnet:?v2")
+    v2.name = v2.name.replace("- 01 ", "- 01v2 ")
+    monkeypatch.setattr(RSSEngine, "_get_torrents", staticmethod(AsyncMock(return_value=[v1, v2])))
+    async with Database() as db, DownloaderPool() as pool:
+        await RSSEngine(db).refresh_rss(pool)
+    assert plugin.test_send.call_count == 1
+    assert "magnet:?v2" in str(plugin.test_send.call_args)
+    async with Database() as db:
+        assert not await db.torrent.search_orphans()

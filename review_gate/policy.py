@@ -15,11 +15,18 @@ class Policy:
     from_episode: float = 1
     cutoff: float = 0
     version_id: str | None = None
+    unfiltered: bool = False
 
     def validate(self):
         if self.mode not in {"future", "backlog"}:
             raise ValueError("mode must be future or backlog")
-        if not self.include or len(self.include) > 32 or len(self.exclude) > 32:
+        if self.unfiltered and (self.include or self.exclude or self.version_id):
+            raise ValueError("不过滤版本不能同时设置版本或关键词")
+        if (
+            (not self.include and not self.unfiltered)
+            or len(self.include) > 32
+            or len(self.exclude) > 32
+        ):
             raise ValueError("至少填写一个必须包含的版本条件，最多 32 项")
         for term in self.include + self.exclude:
             if not isinstance(term, str) or not term.strip() or len(term) > 200:

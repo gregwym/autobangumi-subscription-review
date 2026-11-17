@@ -95,3 +95,50 @@ async def test_unknown_version_and_ambiguous_conditions_refused(plugin, rule, ap
         )
         assert response.status_code == 422
     plugin.test_send.assert_not_called()
+
+
+async def test_unfiltered_api_keeps_download_gate(plugin, rule, api):
+    await plugin.bridge.capture(rule, release())
+    async with api:
+        preview = await api.post(
+            f"/review/rules/{rule.id}/preview", json={"unfiltered": True, "mode": "backlog"}
+        )
+        assert preview.status_code == 200, preview.text
+        assert preview.json()["will_download"] == 1
+        plugin.test_send.assert_not_called()
+        ambiguous = await api.post(
+            f"/review/rules/{rule.id}/preview", json={"unfiltered": True, "version_id": "anything"}
+        )
+        assert ambiguous.status_code == 422
+
+
+async def test_history_api_preview_clear_lifecycle_and_secret_redaction(plugin, rule):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from test_maintenance import add_history
+
+    await add_history(plugin, rule)
+    context = SimpleNamespace(is_running=True, stop=AsyncMock(), start_tasks=AsyncMock())
+    app = FastAPI()
+    app.state.ctx = context
+    app.include_router(plugin.api())
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        result = await client.post(f"/rules/{rule.id}/history/preview", json={"episodes": [1]})
+        assert result.status_code == 200, result.text
+        assert "magnet:" not in result.text
+        assert "snapshot" not in result.text
+        clear = await client.post(
+            f"/rules/{rule.id}/history/clear",
+            json={"preview_token": result.json()["preview_token"]},
+        )
+        assert clear.status_code == 200, clear.text
+        assert clear.json()["cleared_episodes"] == [1]
+        reused = await client.post(
+            f"/rules/{rule.id}/history/clear",
+            json={"preview_token": result.json()["preview_token"]},
+        )
+        assert reused.status_code == 409
+    context.stop.assert_awaited_once()
+    context.start_tasks.assert_awaited_once()
+    plugin.test_send.assert_not_called()

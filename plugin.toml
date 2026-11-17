@@ -1,7 +1,7 @@
 [plugin]
 id = "subscription-review"
 name = "订阅审核"
-version = "0.2.1"
+version = "0.3.0"
 sdk = ">=0.6,<1"
 entry = "review_gate.plugin:SubscriptionReview"
 description = "新番先审核版本再下载；包含适配 AB 4.0.0 的受控 qBittorrent 下载器。"
@@ -25,3 +25,15 @@ slot = "settings.section"
 element = "ab-plugin-subscription-review-settings"
 entry = "web/index.js"
 title = { zh-CN = "订阅审核", en-US = "Subscription review" }
+
+[[plugin.ui]]
+slot = "bangumi.detail.tab"
+element = "ab-plugin-subscription-review-history"
+entry = "web/index.js"
+title = { zh-CN = "下载历史", en-US = "Download history" }
+
+[[plugin.ui]]
+slot = "settings.section"
+element = "ab-plugin-subscription-review-maintenance"
+entry = "web/index.js"
+title = { zh-CN = "下载历史维护", en-US = "History maintenance" }

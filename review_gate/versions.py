@@ -9,12 +9,15 @@ def variants(candidates):
     groups = {}
     for candidate in candidates:
         terms = [candidate.get(k) for k in ("group", "resolution", "source", "subtitle")]
-        codec = re.search(r"\b(HEVC|AVC|x265|x264|H\.265|H\.264)\b", candidate["name"], re.I)
+        codec = re.search(
+            r"(?<![A-Za-z0-9])(HEVC|AVC|x265|x264|H\.265|H\.264)(?![A-Za-z0-9])",
+            candidate["name"],
+            re.I,
+        )
         terms.append(codec[0] if codec else None)
         terms = list(dict.fromkeys(t for t in terms if t))
-        # A meaningful selectable version must identify a group and resolution.
-        # Unparsed releases remain visible via advanced candidate inspection.
-        if not candidate.get("group") or not candidate.get("resolution"):
+        # Missing resolution is an explicit unknown, not a reason to hide a group.
+        if not candidate.get("group"):
             continue
         key = hashlib.sha256(json.dumps([t.casefold() for t in terms]).encode()).hexdigest()[:20]
         entry = groups.setdefault(
