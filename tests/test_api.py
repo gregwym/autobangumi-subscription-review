@@ -142,3 +142,32 @@ async def test_history_api_preview_clear_lifecycle_and_secret_redaction(plugin, 
     context.stop.assert_awaited_once()
     context.start_tasks.assert_awaited_once()
     plugin.test_send.assert_not_called()
+
+
+async def test_multi_version_or_semantics_and_cross_version_dedup(plugin, rule, api):
+    for ep, codec in [(1, "HEVC"), (1, "AVC"), (2, "AVC"), (3, "x265")]:
+        await plugin.bridge.capture(rule, release(ep, codec))
+    async with api:
+        versions = (await api.get(f"/review/rules/{rule.id}/versions")).json()["versions"]
+        ids = [v["id"] for v in versions if v["codec"] in ("HEVC", "AVC")]
+        preview = await api.post(
+            f"/review/rules/{rule.id}/preview", json={"version_ids": ids, "mode": "backlog"}
+        )
+        assert preview.status_code == 200, preview.text
+        assert preview.json()["will_download"] == 2
+        response = await api.post(
+            f"/review/rules/{rule.id}/approve",
+            json={"preview_token": preview.json()["preview_token"]},
+        )
+        assert response.status_code == 200
+        invalid = await api.post(
+            f"/review/rules/{rule.id}/preview", json={"version_ids": ids, "unfiltered": True}
+        )
+        assert invalid.status_code == 422
+        unknown = await api.post(
+            f"/review/rules/{rule.id}/preview", json={"version_ids": ["unknown"]}
+        )
+        assert unknown.status_code == 409
+    await plugin.bridge.replay()
+    assert plugin.test_send.call_count == 2
+    assert "x265" not in str(plugin.test_send.call_args_list)

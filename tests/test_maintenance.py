@@ -153,3 +153,11 @@ async def test_hibike_missing_resolution_and_season_episode_ambiguity(plugin, ru
     assert versions[0]["count"] == 4
     assert versions[0]["codec"] == "HEVC"
     assert versions[0]["resolution"] is None
+
+
+async def test_bracket_v2_is_preferred_even_when_ab_parser_omits_revision(plugin, rule):
+    rule.season = 3
+    name = "[北宇治字幕组] 吹响吧！上低音号 第三季 / Hibike! Euphonium 3 [03v2][WebRip][HEVC_AAC][简繁日内封][招募时轴]"
+    parsed = plugin.bridge.parsed_data(rule, name)
+    assert parsed["episode"] == 3
+    assert parsed["revision"] == 2

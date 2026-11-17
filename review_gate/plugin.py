@@ -24,6 +24,7 @@ class ReviewRequest(BaseModel):
     mode: str = "future"
     from_episode: float = Field(default=1, ge=0, le=100000)
     unfiltered: bool = False
+    version_ids: list[str] = Field(default_factory=list, max_length=100)
 
 
 class HistoryRequest(BaseModel):
@@ -124,8 +125,17 @@ class SubscriptionReview(Plugin):
                 rule = await find_rule(rid)
                 items = await self.store.candidates(rid)
                 data = body.model_dump(exclude={"version_id"})
-                if body.unfiltered and (body.version_id or body.include or body.exclude):
+                if body.unfiltered and (
+                    body.version_id or body.version_ids or body.include or body.exclude
+                ):
                     raise HTTPException(422, "不过滤版本不能同时设置版本或关键词")
+                if body.version_ids:
+                    if body.version_id or body.include:
+                        raise HTTPException(422, "请选择多个版本或自定义关键词，不能同时设置")
+                    available = {v["id"] for v in variants(items)}
+                    if not set(body.version_ids) <= available:
+                        raise HTTPException(409, "所选版本已变化，请刷新后重新选择")
+                    data["version_ids"] = sorted(set(body.version_ids))
                 if body.version_id:
                     selected = next(
                         (v for v in variants(items) if v["id"] == body.version_id), None

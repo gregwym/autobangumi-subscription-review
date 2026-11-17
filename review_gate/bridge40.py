@@ -216,6 +216,9 @@ class Bridge40:
         }
         fields["episode_key"] = None
         fields["revision"] = preference_revision(release) if release else 1
+        bracket_revision = re.search(r"\[(\d{1,3}(?:\.5)?)v(\d+)\]", name, re.I)
+        if identity and bracket_revision and float(bracket_revision[1]) == identity[2]:
+            fields["revision"] = max(fields["revision"], int(bracket_revision[2]))
         if identity:
             # Include official title + mapped season/type/episode, shared across
             # rules, so a different group cannot re-download an existing episode.
