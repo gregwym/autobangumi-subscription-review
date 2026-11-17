@@ -107,7 +107,7 @@ PYTHONPATH=/tmp/ab-4.0/backend/src /tmp/ab-4.0/backend/.venv/bin/ab-plugin valid
 python3 tools/build.py
 ```
 
-`dist/subscription-review-0.3.1.zip` 是允许列表打包的安装包，不含测试状态、凭据、缓存或源码 checkout。CI 针对同一个官方 commit 验证。
+`dist/subscription-review-0.4.0.zip` 是允许列表打包的安装包，不含测试状态、凭据、缓存或源码 checkout。CI 针对同一个官方 commit 验证。
 
 ## 后续上游方向
 
