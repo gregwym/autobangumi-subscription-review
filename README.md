@@ -4,6 +4,8 @@
 
 [下载安装包](https://github.com/gregwym/autobangumi-subscription-review/releases/latest) · [维护与回滚](https://github.com/gregwym/autobangumi-subscription-review/blob/main/docs/MAINTENANCE.md) · [AB API 提案](https://github.com/gregwym/autobangumi-subscription-review/blob/main/docs/UPSTREAM_API.md)
 
+![下载版本多选（示例数据）](https://raw.githubusercontent.com/gregwym/autobangumi-subscription-review/main/docs/images/download-versions.png)
+
 ## 功能
 
 - 海报显示「待选版本／追番中」，番剧详情增加「下载版本」和「下载历史」。
