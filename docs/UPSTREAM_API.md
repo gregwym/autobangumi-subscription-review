@@ -1,6 +1,8 @@
 # AB 插件 API 需求
 
-两个插件的共同提案集中维护在[媒体库整理仓库](https://github.com/gregwym/autobangumi-library-organizer/blob/main/docs/UPSTREAM_API.md)，避免分别维护两套契约。当前仅为提案，尚未提交上游 PR。
+两个插件的共同提案集中维护在[媒体库整理仓库](https://github.com/gregwym/autobangumi-library-organizer/blob/main/docs/UPSTREAM_API.md)，避免分别维护两套契约。宿主服务已在 [AB #1164](https://github.com/EstrellaXD/Auto_Bangumi/pull/1164) 实现并提交，等待 review，尚未合并。当前插件发行版仍保留 4.0 兼容层。
+
+独立修复：[定时任务作用域 #1162](https://github.com/EstrellaXD/Auto_Bangumi/pull/1162)、[弹窗焦点 #1163](https://github.com/EstrellaXD/Auto_Bangumi/pull/1163)。实际接口见 [SDK 0.7 服务文档](https://github.com/gregwym/Auto_Bangumi/blob/d55882392ae967b09b8d8c02cf4435b353800ca4/docs/dev/plugins/services.md)。
 
 订阅审核的主要需求：
 
