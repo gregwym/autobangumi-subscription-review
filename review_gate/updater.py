@@ -19,6 +19,8 @@ from pathlib import Path, PurePosixPath
 
 from packaging.version import Version
 
+from .audit import Audit, traced
+
 REPO = "gregwym/autobangumi-subscription-review"
 PLUGIN_ID = "subscription-review"
 API = f"https://api.github.com/repos/{REPO}/releases/latest"
@@ -119,7 +121,8 @@ def unpack(data, checksum, stage, version):
 
 
 class Updater:
-    def __init__(self, root, data_dir, bridge):
+    def __init__(self, root, data_dir, bridge, audit=None):
+        self.audit = audit or Audit()
         self.root, self.data_dir, self.bridge = Path(root), Path(data_dir), bridge
         self.version = tomllib.loads((self.root / "plugin.toml").read_text())["plugin"]["version"]
         self.latest = None
@@ -143,6 +146,7 @@ class Updater:
             ),
         }
 
+    @traced("maintenance.update-check")
     async def check(self):
         async with self.lock:
             try:
@@ -158,6 +162,7 @@ class Updater:
             self.checked_at = time.time()
             return self.status()
 
+    @traced("update.install")
     async def install(self, version, context):
         async with self.lock:
             disk_version = tomllib.loads((self.root / "plugin.toml").read_text())["plugin"][

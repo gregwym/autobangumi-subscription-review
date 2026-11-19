@@ -9,13 +9,15 @@ import time
 from contextlib import closing
 from pathlib import Path
 
+from .audit import Audit
 from .policy import Policy, candidate_id, fingerprint
 from .versions import variants
 
 
 class Store:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, audit=None):
         self.path = path
+        self.audit = audit or Audit()
 
     def _run(self, action, *args):
         with closing(sqlite3.connect(self.path, timeout=10)) as db, db:
@@ -94,7 +96,18 @@ class Store:
         return cid
 
     async def capture(self, rule, torrent, parsed):
-        return await self.call(self._capture, rule, torrent, parsed)
+        def capture(db):
+            cid = candidate_id(rule["id"], torrent["url"])
+            previous = db.execute("SELECT 1 FROM candidates WHERE id=?", (cid,)).fetchone()
+            self._capture(db, rule, torrent, parsed)
+            return cid, not previous
+
+        cid, created = await self.call(capture)
+        if created:
+            self.audit.emit(
+                "candidate.captured", candidate_id=cid, rule_id=rule["id"], name=torrent["name"]
+            )
+        return cid
 
     async def move_candidate(self, candidate, rule, parsed):
         def move(db):

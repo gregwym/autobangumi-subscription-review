@@ -11,7 +11,10 @@ import asyncio
 import contextvars
 import inspect
 import json
+import logging
 import re
+
+from .audit import Audit, traced
 
 PROVIDER = "subscription-review-qbittorrent"
 
@@ -19,6 +22,7 @@ PROVIDER = "subscription-review-qbittorrent"
 class Bridge40:
     def __init__(self, store, log):
         self.store, self.log = store, log
+        self.audit = Audit(log)
         self.lock = asyncio.Lock()
         self.replay_lock = asyncio.Lock()
         self.active = False
@@ -53,6 +57,7 @@ class Bridge40:
             raise RuntimeError("AB 批次过滤接口已变化；拒绝安装适配层")
         bridge = self
 
+        @traced("rss.capture", quiet=True, audit=bridge.audit)
         async def reviewed_filters(engine, torrents, matches):
             # Capture the whole batch before choosing v1/v2, independent of RSS order.
             captured = []
@@ -107,6 +112,7 @@ class Bridge40:
         RSSEngine.match_torrent = reviewed_match
         self.client_factory = GuardedQb
 
+        @traced("download.dispatch", quiet=True, audit=bridge.audit)
         async def guarded_add(client, torrent, bangumi):
             from ab_sdk.downloader import AddResult
 
@@ -125,6 +131,13 @@ class Bridge40:
                     candidate = await bridge.store.candidate(cid)
                     reason = await bridge.store.decision(candidate)
                     if reason not in (None, "已投递"):
+                        bridge.audit.emit(
+                            "download.held",
+                            level=logging.DEBUG,
+                            rule_id=bangumi.id,
+                            candidate_id=cid,
+                            reason=reason,
+                        )
                         return AddResult.FAILED
                     candidates.append((item, candidate, reason))
                 result = AddResult.DUPLICATE
@@ -142,16 +155,40 @@ class Bridge40:
                     )
                     try:
                         outcome = await bridge.original(client, item, bangumi)
-                    except Exception:
+                    except Exception as error:
                         await bridge.store.mark(candidate["id"], "retry", "投递异常；稍后重试")
+                        bridge.audit.emit(
+                            "download.retry",
+                            level=logging.WARNING,
+                            rule_id=bangumi.id,
+                            candidate_id=candidate["id"],
+                            error=type(error).__name__,
+                            detail=str(error),
+                        )
                         raise
                     finally:
                         bridge.permit.reset(grant)
                     if outcome is AddResult.FAILED:
                         await bridge.store.mark(candidate["id"], "retry", "下载器未确认接收")
+                        bridge.audit.emit(
+                            "download.retry",
+                            level=logging.WARNING,
+                            rule_id=bangumi.id,
+                            candidate_id=candidate["id"],
+                            detail="下载器未确认接收",
+                        )
                         return outcome
                     await bridge.store.delivered(
                         candidate, instance_id=client.instance_id, save_path=bangumi.save_path
+                    )
+                    bridge.audit.emit(
+                        "download.submitted",
+                        rule_id=bangumi.id,
+                        candidate_id=candidate["id"],
+                        name=candidate["name"],
+                        downloader=client.instance_id,
+                        result=outcome.value,
+                        detail="下载器已接受；尚非下载完成",
                     )
                     result = outcome
                 return result
@@ -223,6 +260,7 @@ class Bridge40:
         async with self.lock:
             known = {(c["rule_id"], c["url"]): c for c in await self.store.candidates()}
             backup = None
+            repaired = []
             async with Database() as db:
                 rules = await db.bangumi.search_all()
                 by_id = {r.id: r for r in rules if not r.deleted}
@@ -259,7 +297,12 @@ class Bridge40:
                     )
                     torrent.bangumi_id = target.id
                     db.add(torrent)
+                    repaired.append(
+                        {"torrent_id": torrent.id, "from_rule": old.id, "to_rule": target.id}
+                    )
                 await db.commit()
+            if repaired:
+                self.audit.emit("maintenance.associations", repaired=repaired, backup=str(backup))
 
     @staticmethod
     def rule_data(rule):
@@ -389,6 +432,15 @@ class Bridge40:
                     )
                 )
             await self.store.refresh_metadata(updates)
+            self.audit.emit(
+                "history.sync",
+                level=logging.DEBUG,
+                rules=len(by_id),
+                history=len(history),
+                candidates=len(updates),
+                writes=["plugin rules/candidates/episode identities"],
+                grants_approval=False,
+            )
 
     async def health(self):
         from module.conf import VERSION, settings
@@ -559,13 +611,31 @@ class Bridge40:
                     db.add(torrent)
                     fixed.append(torrent.id)
                 await db.commit()
+        if fixed or merged:
+            self.audit.emit(
+                "maintenance.orphans",
+                repaired=fixed,
+                merged=merged,
+                backup=backup,
+                writes=["AB torrent associations", "plugin candidates"],
+            )
         return {"repaired": fixed, "merged": merged, "backup": backup}
 
+    @traced("maintenance.queue", quiet=True)
     async def replay(self):
         async with self.replay_lock:
             await self.sync_history()
-            await self.repair_orphans()
-            return await self._replay()
+            repairs = await self.repair_orphans()
+            result = await self._replay()
+            self.audit.periodic(
+                "maintenance.queue",
+                **result,
+                repaired=len(repairs["repaired"]),
+                merged=len(repairs["merged"]),
+                reads=["AB rules/history", "plugin candidates/policies/dedup"],
+                writes=["plugin history/metadata cache"],
+            )
+            return result
 
     async def _replay(self):
         from ab_sdk.downloader import AddResult
@@ -617,6 +687,9 @@ class Bridge40:
                     rule.save_path = candidate.get("sent_save_path") or rule.save_path
                     await self.reconcile(candidate, rule, torrent, instance_id)
                     await self.store.mark(candidate["id"], "delivered")
+                    self.audit.emit(
+                        "download.receipt.reconciled", candidate_id=candidate["id"], rule_id=rule.id
+                    )
                     continue
                 # Replay is not permission to bypass host exclusions or plugins.
                 if any(re.search(p, torrent.name) for p in settings.rss_parser.filter):
@@ -633,6 +706,15 @@ class Bridge40:
                     await self.reconcile(candidate, rule, torrent, instance_id)
                     await self.store.mark(candidate["id"], "delivered")
                     sent += 1
-            except Exception:
-                self.log.exception("审核队列投递失败；保留候选等待重试")
+
+            except Exception as error:
+                self.audit.emit(
+                    "download.retry",
+                    error=type(error).__name__,
+                    reason=str(error),
+                    level=logging.WARNING,
+                    rule_id=candidate["rule_id"],
+                    candidate_id=candidate["id"],
+                    detail="审核队列投递失败；保留候选等待重试",
+                )
         return {"sent": sent, "held": held}

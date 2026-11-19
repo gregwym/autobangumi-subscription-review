@@ -12,6 +12,7 @@ from ab_sdk.tasks import ScheduledTask
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from .audit import Audit
 from .bridge40 import PROVIDER, Bridge40
 from .policy import Policy
 from .store import Store
@@ -52,16 +53,20 @@ def snapshot(revision, candidates):
 
 class SubscriptionReview(Plugin):
     async def setup(self):
+        self.audit = Audit(self.ctx.log)
         self.previews = {}
         self.history_previews = {}
         self.maintenance_lock = asyncio.Lock()
-        self.store = Store(self.ctx.data_dir / "review.sqlite3")
+        self.store = Store(self.ctx.data_dir / "review.sqlite3", self.audit)
         await self.store.init()
         self.bridge = Bridge40(self.store, self.ctx.log)
-        self.updater = Updater(Path(__file__).resolve().parents[1], self.ctx.data_dir, self.bridge)
+        self.updater = Updater(
+            Path(__file__).resolve().parents[1], self.ctx.data_dir, self.bridge, self.audit
+        )
         await self.bridge.setup()
         try:
             await self.bridge.sync_history()
+            self.audit.emit("plugin.started", replay_interval=30, update_interval=21600)
         except BaseException:
             await self.bridge.teardown()
             raise
@@ -89,7 +94,7 @@ class SubscriptionReview(Plugin):
 
     @provider(points.API_ROUTER, id="api")
     def api(self):
-        router = APIRouter()
+        router = APIRouter(route_class=self.audit.route())
 
         async def find_rule(rid):
             for r in await self.store.rules():
@@ -224,6 +229,13 @@ class SubscriptionReview(Plugin):
                 if snapshot(rule["revision"], items) != receipt["snapshot"]:
                     raise HTTPException(409, "候选或规则已变化，请重新预览")
                 await self.store.set_policy(rid, receipt["policy"], receipt["revision"])
+                self.audit.emit(
+                    "rule.approved",
+                    rule_id=rid,
+                    revision=receipt["revision"],
+                    mode=receipt["policy"].mode,
+                    unfiltered=receipt["policy"].unfiltered,
+                )
             return {"approved": True, "message": "已开始追番，后续新集将按此版本自动下载"}
 
         @router.post("/rules/{rid}/hold")
@@ -231,6 +243,7 @@ class SubscriptionReview(Plugin):
             async with self.bridge.lock:
                 await find_rule(rid)
                 await self.store.hold(rid)
+                self.audit.emit("rule.held", rule_id=rid)
             return {"held": True}
 
         @router.get("/maintenance/rules")
@@ -278,7 +291,9 @@ class SubscriptionReview(Plugin):
                     await context.stop()
                 try:
                     async with self.bridge.replay_lock, self.bridge.lock:
-                        return await asyncio.to_thread(self.bridge.maintenance().clear, receipt)
+                        result = await asyncio.to_thread(self.bridge.maintenance().clear, receipt)
+                        self.audit.emit("maintenance.history.cleared", rule_id=rid, result=result)
+                        return result
                 except ValueError as e:
                     raise HTTPException(409, str(e)) from e
                 finally:

@@ -12,6 +12,8 @@ from contextlib import closing, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
+from .audit import Audit
+
 
 def digest(value):
     return hashlib.sha256(
@@ -197,6 +199,11 @@ class Maintenance:
                 if dest.execute("PRAGMA quick_check").fetchone()[0] != "ok":
                     raise ValueError("数据库备份校验失败，未执行清理")
             os.chmod(path, 0o600)
+        Audit().emit(
+            "database.backup",
+            sources=[str(self.host_path), str(self.review_path)],
+            target=str(directory),
+        )
         return directory
 
     def clear(self, receipt):

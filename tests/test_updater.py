@@ -1,4 +1,5 @@
 import hashlib
+import inspect
 import io
 import json
 import shutil
@@ -115,7 +116,7 @@ async def test_update_real_host_loader_and_rollback(tmp_path, monkeypatch, broke
         }
         # Patch the isolated module loaded by AB, not the source checkout.
         monkeypatch.setitem(
-            updater.check.__func__.__globals__, "fetch", lambda url, limit: payloads[url]
+            inspect.unwrap(updater.check).__globals__, "fetch", lambda url, limit: payloads[url]
         )
         context = SimpleNamespace(
             is_running=True, stop=AsyncMock(), start_tasks=AsyncMock(), plugins=manager
