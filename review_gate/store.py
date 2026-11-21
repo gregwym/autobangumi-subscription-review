@@ -78,7 +78,7 @@ class Store:
         await self.call(self._rule, rule)
 
     @classmethod
-    def _capture(cls, db, rule, torrent, parsed):
+    def _capture(cls, db, rule, torrent, parsed, first_seen=None):
         cls._rule(db, rule)
         cid = candidate_id(rule["id"], torrent["url"])
         data = {
@@ -90,15 +90,21 @@ class Store:
         }
         db.execute(
             "INSERT INTO candidates(id,rule_id,url,payload,first_seen) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",
-            (cid, rule["id"], torrent["url"], json.dumps(data, ensure_ascii=False), time.time()),
+            (
+                cid,
+                rule["id"],
+                torrent["url"],
+                json.dumps(data, ensure_ascii=False),
+                time.time() if first_seen is None else first_seen,
+            ),
         )
         return cid
 
-    async def capture(self, rule, torrent, parsed):
+    async def capture(self, rule, torrent, parsed, *, first_seen=None):
         def capture(db):
             cid = candidate_id(rule["id"], torrent["url"])
             previous = db.execute("SELECT 1 FROM candidates WHERE id=?", (cid,)).fetchone()
-            self._capture(db, rule, torrent, parsed)
+            self._capture(db, rule, torrent, parsed, first_seen)
             return cid, not previous
 
         cid, created = await self.call(capture)
@@ -119,12 +125,6 @@ class Store:
                 (candidate["first_seen"], cid),
             )
             db.execute("DELETE FROM candidates WHERE id=? AND status='held'", (candidate["id"],))
-            if not db.execute(
-                "SELECT 1 FROM delivered WHERE episode_key=?", (parsed.get("episode_key"),)
-            ).fetchone():
-                db.execute(
-                    "UPDATE rules SET state='pending',revision=revision+1 WHERE id=?", (rule["id"],)
-                )
 
         await self.call(move)
 

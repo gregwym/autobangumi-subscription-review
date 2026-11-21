@@ -5,6 +5,8 @@ import unicodedata
 from collections import defaultdict
 from urllib.parse import parse_qs, urlsplit
 
+from .batch import parse_review_release
+
 MIKAN_HOSTS = {"mikanani.me", "mikanime.tv"}
 REVISION = re.compile(r"(?<!\w)v([1-9]\d*)(?!\w)", re.I)
 
@@ -33,7 +35,6 @@ def normalized_title(title):
 
 def confirmed_features(rules, torrents, sources):
     from module.database.bangumi import _all_title_patterns, _normalize_group_name
-    from module.parser.analyser.selector import parse_configured_release_title
     from module.parser.analyser.tokenizer.result import MediaType, ReleaseKind
 
     subscriptions = {
@@ -51,7 +52,7 @@ def confirmed_features(rules, torrents, sources):
         if key in seen:
             continue
         seen.add(key)
-        release = parse_configured_release_title(torrent["name"])
+        _, release = parse_review_release(torrent["name"])
         if release is None:
             continue
         if release.episode is not None or release.release_kind is not ReleaseKind.SINGLE:

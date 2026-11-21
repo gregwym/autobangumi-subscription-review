@@ -196,7 +196,7 @@ async def test_store_persists_pending_across_restart(plugin, rule):
 async def test_corrupt_store_is_fail_closed(plugin, rule, monkeypatch):
     from module.downloader import DownloadClient
 
-    async def failed(*args):
+    async def failed(*args, **kwargs):
         raise OSError("disk unavailable")
 
     monkeypatch.setattr(plugin.store, "capture", failed)

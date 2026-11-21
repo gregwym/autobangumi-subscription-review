@@ -20,6 +20,7 @@ from .batch import (
     bounded_batch,
     discover_batches,
     global_excluded,
+    parse_review_release,
     parsed_batch,
     project_batch,
 )
@@ -46,10 +47,8 @@ class Bridge40:
         from module.downloader.client.qb_downloader import QbDownloader
         from module.downloader.download_client import DownloadClient
         from module.models import ResponseModel
-        from module.parser.analyser.selector import (
-            parse_configured_release_title,
-            parser_engine_snapshot,
-        )
+        from module.parser.analyser.selector import parser_engine_snapshot
+        from module.parser.analyser.tokenizer.result import ReleaseKind
         from module.rss.analyser import RSSAnalyser
         from module.rss.engine import RSSEngine
 
@@ -126,29 +125,28 @@ class Bridge40:
                 raise RuntimeError("审核下载器不允许创建绕过审核的 qB RSS 规则")
 
         def reviewed_match(engine, torrent, rules):
-            release = parse_configured_release_title(torrent.name)
-            batch = bounded_batch(torrent.name, release)
-            selected = bridge.match_rule(torrent.name, rules, release=release, batch=batch)
-            if batch is not None:
-                if not selected or global_excluded(torrent.name):
-                    return None
-                if selected.filter and engine._get_filter_pattern(selected.filter).search(
-                    torrent.name
-                ):
-                    return None
-                torrent.bangumi_id = selected.id
-                return selected
-            return bridge.original_match(engine, torrent, [selected]) if selected else None
+            selected = bridge.match_rule(torrent.name, rules)
+            if not selected or global_excluded(torrent.name):
+                return None
+            if selected.filter and engine._get_filter_pattern(selected.filter).search(torrent.name):
+                return None
+            torrent.bangumi_id = selected.id
+            return selected
 
         async def reviewed_discovery(analyser, rss, torrents, engine, bangumi_list):
             with parser_engine_snapshot():
                 regular, batches = [], []
                 for torrent in await engine.db.torrent.check_new(torrents, rss=rss):
-                    batch = parsed_batch(torrent.name)
+                    if global_excluded(torrent.name):
+                        continue
+                    normalized, release = parse_review_release(torrent.name)
+                    batch = bounded_batch(torrent.name, release)
                     if batch is not None:
                         batches.append((torrent, batch))
-                    else:
+                    elif normalized == torrent.name:
                         regular.append(torrent)
+                    elif release is not None and release.release_kind is ReleaseKind.SINGLE:
+                        regular.append(torrent.model_copy(update={"name": normalized}))
                 added = await bridge.original_discovery(
                     analyser, rss, regular, engine, bangumi_list
                 )
@@ -173,11 +171,19 @@ class Bridge40:
                 for torrent in torrents:
                     if global_excluded(torrent.name):
                         continue
-                    batch = parsed_batch(torrent.name)
+                    normalized, release = parse_review_release(torrent.name)
+                    batch = bounded_batch(torrent.name, release)
                     if batch is not None:
                         batches.append((torrent, batch))
-                    else:
-                        data = await analyser.torrent_to_data(torrent, rss)
+                    elif normalized == torrent.name or (
+                        release is not None and release.release_kind is ReleaseKind.SINGLE
+                    ):
+                        for_parser = (
+                            torrent
+                            if normalized == torrent.name
+                            else torrent.model_copy(update={"name": normalized})
+                        )
+                        data = await analyser.torrent_to_data(for_parser, rss)
                         if data:
                             return data
                 if batches:
@@ -314,7 +320,7 @@ class Bridge40:
         # Already-created GuardedQb instances retain active=False and refuse adds.
 
     @staticmethod
-    def match_rule(name, rules, *, release=None, batch=None):
+    def match_rule(name, rules, *, batch=None):
         """Preserve host title/type matching, prefer exact groups, never guess a season."""
         from module.database.bangumi import (
             _all_title_patterns,
@@ -322,9 +328,16 @@ class Bridge40:
             _normalize_group_name,
             match_bangumi_in_list,
         )
-        from module.parser.analyser.selector import parse_configured_release_title
+        from module.parser.analyser.tokenizer.result import ReleaseKind
 
-        release = batch or release or parse_configured_release_title(name)
+        normalized, release = parse_review_release(name) if batch is None else (name, batch)
+        batch = batch or bounded_batch(name, release)
+        if batch is None and (
+            (release is not None and release.release_kind is not ReleaseKind.SINGLE)
+            or (release is None and normalized != name)
+        ):
+            return None
+        release = batch or release
         title = release and (release.title_en or release.title_zh or release.title_jp)
         if batch is not None:
             matching = [
@@ -344,7 +357,7 @@ class Bridge40:
                 (len(p) for p in _all_title_patterns(rule) if p in name or p == title),
                 default=0,
             )
-            if not length or (batch is None and not match_bangumi_in_list(name, [rule])):
+            if not length or (batch is None and not match_bangumi_in_list(normalized, [rule])):
                 continue
             group = release.group if release else None
             exact = bool(
@@ -366,7 +379,6 @@ class Bridge40:
         """Repair only unsent plugin candidates with an unambiguous exact-group match."""
         from module.database import Database
         from module.database.bangumi import _normalize_group_name
-        from module.parser.analyser.selector import parse_configured_release_title
 
         async with self.lock:
             known = {(c["rule_id"], c["url"]): c for c in await self.store.candidates()}
@@ -386,11 +398,12 @@ class Bridge40:
                     ):
                         continue
                     target = self.match_rule(torrent.name, rules)
-                    release = parse_configured_release_title(torrent.name)
+                    _, release = parse_review_release(torrent.name)
                     if (
                         not target
                         or target.id == old.id
                         or target.archived
+                        or self.exclusion_check(target.filter)(torrent.name)
                         or old.official_title != target.official_title
                         or old.season == target.season
                         or not release
@@ -494,11 +507,10 @@ class Bridge40:
     @staticmethod
     def parsed_data(rule, name, *, feature=False):
         from module.manager.revision_policy import _adjust_episode
-        from module.parser.analyser.selector import parse_configured_release_title
         from module.parser.analyser.tokenizer.result import ReleaseKind
         from module.parser.release_policy import preference_identity, preference_revision
 
-        release = parse_configured_release_title(name)
+        normalized, release = parse_review_release(name)
         batch = bounded_batch(name, release)
         if batch is not None:
             release = batch
@@ -514,7 +526,7 @@ class Bridge40:
         ):
             from module.parser.analyser.tokenizer import classic
 
-            alternate = classic.parse_release_title(name)
+            alternate = classic.parse_release_title(normalized)
             if (
                 alternate
                 and alternate.release_kind is ReleaseKind.SINGLE
@@ -568,13 +580,14 @@ class Bridge40:
         feature = proof is not None and proof == fingerprint(self.rule_data(rule))
         return self.parsed_data(rule, name, feature=feature)
 
-    async def capture(self, rule, torrent):
+    async def capture(self, rule, torrent, *, first_seen=None):
         if not rule.id:
             raise ValueError("番剧规则尚未入库")
         return await self.store.capture(
             self.rule_data(rule),
             self.torrent_data(torrent),
             self.parse_candidate(rule, torrent.name, torrent.url),
+            first_seen=first_seen,
         )
 
     async def filter(self, torrent, bangumi):
@@ -735,30 +748,30 @@ class Bridge40:
         return Maintenance(engine.url.database, self.store.path, self.parse_candidate)
 
     async def orphan_records(self):
-        from module.conf import settings
         from module.database import Database
-        from module.database.bangumi import match_bangumi_in_list
-        from module.rss.engine import RSSEngine
 
         candidates = await self.store.candidates()
-        known = {c["url"]: c for c in candidates}
+        known = {c["url"] for c in candidates}
         rows = []
         async with Database() as db:
             rules = await db.bangumi.search_all()
-            engine = RSSEngine(db)
             for t in await db.torrent.search_orphans():
-                rule = engine.match_torrent(t, rules)
-                excluded = any(re.search(p, t.name) for p in settings.rss_parser.filter)
+                rule = self.match_rule(t.name, rules)
+                excluded = self.exclusion_check(rule.filter if rule else None)(t.name)
+                repairable = False
                 if excluded:
-                    reason, rule = "被 AB 全局过滤条件排除", None
-                elif rule:
+                    reason = excluded
+                elif not rule:
+                    reason = "没有匹配的有效番剧规则；需先在 AB 修正标题或添加规则"
+                elif rule.archived:
+                    reason = "匹配的番剧已归档"
+                elif t.downloaded and t.url not in known and parsed_batch(t.name) is None:
+                    reason = "已有下载但缺少可确认的历史关联"
+                else:
                     reason = (
                         "审核暂缓留下的未关联记录" if t.url in known else "可关联到现有番剧规则"
                     )
-                elif match_bangumi_in_list(t.name, rules):
-                    reason = "被单番过滤条件排除"
-                else:
-                    reason = "没有匹配的有效番剧规则；需先在 AB 修正标题或添加规则"
+                    repairable = True
                 rows.append(
                     {
                         "id": t.id,
@@ -767,15 +780,13 @@ class Bridge40:
                         "rule_id": rule.id if rule else None,
                         "rule_title": rule.official_title if rule else None,
                         "reason": reason,
+                        "repairable": repairable,
                         "known": t.url in known,
                     }
                 )
-            # match_torrent changes in-memory objects; this diagnostic is read-only.
-            await db.rollback()
         return rows
 
     async def repair_orphans(self, ids=None):
-        from module.conf import settings
         from module.database import Database
         from module.rss.engine import RSSEngine
 
@@ -810,19 +821,19 @@ class Bridge40:
                         and parsed_batch(torrent.name) is None
                     ):
                         continue
-                    if any(re.search(p, torrent.name) for p in settings.rss_parser.filter):
-                        continue
                     rule = engine.match_torrent(torrent, rules)
                     if not rule or rule.archived:
                         continue
-                    await self.capture(rule, torrent)
+                    # Already persisted by AB. If the plugin has no original
+                    # observation time, don't treat it as new for future-only rules.
+                    await self.capture(rule, torrent, first_seen=0)
                     if torrent.downloaded:
                         await self.store.seed(
                             self.rule_data(rule),
                             self.torrent_data(torrent),
                             self.parse_candidate(rule, torrent.name, torrent.url),
                         )
-                    if ids is not None or torrent.url not in known:
+                    if ids is not None:
                         await self.store.hold(rule.id)
                     db.add(torrent)
                     fixed.append(torrent.id)

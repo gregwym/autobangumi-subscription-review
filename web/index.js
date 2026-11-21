@@ -296,7 +296,7 @@ class Maintenance extends HTMLElement {
     if (!this.shadowRoot) this.attachShadow({mode:'open'});
     this.shadowRoot.innerHTML = settingsFrame('下载历史维护', `<p>查找现有番剧及已删除规则留下的下载历史。</p>
       <label class="field">番剧<input id="search" placeholder="输入番名筛选"><select id="rule"><option value="">选择番剧…</option></select></label>
-      <div id="history"></div><details><summary>检查未匹配种子</summary><button id="refresh">刷新</button><div id="orphans"></div><button id="repair">重新关联可识别记录</button><p id="message" role="status"></p></details>`);
+      <div id="history"></div><details><summary>检查未匹配种子</summary><button id="refresh">刷新</button><div id="orphans"></div><button id="repair" disabled>修复并暂停</button><p id="message" role="status"></p></details>`);
     this.$ = id => this.shadowRoot.getElementById(id);
     this.$('search').oninput = () => this.options();
     this.$('rule').onchange = () => {
@@ -305,12 +305,12 @@ class Maintenance extends HTMLElement {
     };
     this.$('refresh').onclick = () => this.orphans();
     this.$('repair').onclick = async () => {
-      const ids = (this.orphanRows || []).filter(r => r.rule_id).map(r => r.id);
+      const ids = (this.orphanRows || []).filter(r => r.repairable).map(r => r.id);
       if (!ids.length) return;
       this.$('repair').disabled = true;
       try {const result = await this.host.api.post('maintenance/orphans/repair', {ids}); invalidateRules(); await this.orphans(); this.$('message').textContent = `已关联 ${result.repaired.length} 条，合并 ${result.merged.length} 条重复记录。相关番剧先等待选版本。`;}
       catch(e) {this.$('message').textContent = e.message || String(e);}
-      finally {this.$('repair').disabled = false;}
+      finally {this.$('repair').disabled = !(this.orphanRows || []).some(r => r.repairable);}
     };
     this.host.api.get('maintenance/rules').then(data => {this.rows = data; this.options();}).catch(e => {this.$('message').textContent = e.message;});
     this.orphans();
@@ -326,8 +326,8 @@ class Maintenance extends HTMLElement {
     try {
       this.orphanRows = await this.host.api.get('maintenance/orphans'); this.$('orphans').replaceChildren();
       for (const row of this.orphanRows) {const el = document.createElement('div'); el.className = 'match'; el.textContent = `#${row.id} ${row.name} · ${row.reason}${row.rule_title ? ' → ' + row.rule_title : ''}`; this.$('orphans').append(el);}
-      this.$('message').textContent = this.orphanRows.length ? `共 ${this.orphanRows.length} 条未匹配记录。重新关联会暂停涉及番剧，等待确认版本。` : '没有未匹配种子。';
-      this.$('repair').disabled = !this.orphanRows.some(r => r.rule_id);
+      this.$('message').textContent = this.orphanRows.length ? `共 ${this.orphanRows.length} 条未匹配记录。手动修复会暂停已关联的番剧，等待确认版本。` : '没有未匹配种子。';
+      this.$('repair').disabled = !this.orphanRows.some(r => r.repairable);
     } catch(e) {this.$('message').textContent = e.message || String(e);}
   }
 }

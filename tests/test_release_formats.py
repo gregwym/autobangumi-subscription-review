@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import time
 from unittest.mock import AsyncMock
 
 import pytest
@@ -16,6 +17,14 @@ PANTS = (
 FEATURE = (
     "[喵萌奶茶屋&LoliHouse] 超时空辉夜姬！ / Chou Kaguya-hime!{} "
     "[WebRip 1080p HEVC-10bit AAC][简繁内封字幕](检索用：超时空辉耀姬！)"
+)
+NEEDY = (
+    "[LoliHouse] 主播女孩重度依赖 / NEEDY GIRL OVERDOSE "
+    "[01-13话][WebRip 1080p HEVC-10bit AAC][简繁内封字幕][Fin]"
+)
+REZERO = (
+    "[百冬练习组&LoliHouse] Re:从零开始的异世界生活 / "
+    "Re:Zero kara Hajimeru Isekai Seikatsu - 81{} [WebRip 1080p HEVC-10bit AAC][简繁内封字幕]"
 )
 
 
@@ -258,3 +267,164 @@ async def test_mikan_revision_pair_uses_saved_id_and_sends_v2_once(plugin, monke
     else:
         assert not variants(entries)
         plugin.test_send.assert_not_called()
+
+
+@pytest.mark.parametrize("engine", ["tokenizer", "classic"])
+@pytest.mark.parametrize(("season", "chinese"), [(2, "二"), (4, "四")])
+def test_equivalent_bilingual_seasons_do_not_look_like_multiple_seasons(
+    plugin, rule, engine, season, chinese
+):
+    from module.conf import settings
+
+    settings.rss_parser.engine = engine
+    rule.season = season
+    other = rule.model_copy(update={"id": 999, "season": season + 1})
+    title = f"[Group] 示例第{chinese}季 / Example Show S{season} [01-12 合集][1080p HEVC]"
+    assert plugin.bridge.match_rule(title, [rule, other]) is rule
+    assert plugin.bridge.parsed_data(rule, title)["episode_end"] == 12
+    unbracketed = title.replace("[01-12 合集]", "- 01-12 ")
+    assert plugin.bridge.match_rule(unbracketed, [rule, other]) is rule
+    mismatched = title.replace(f"S{season}", f"S{season + 1}")
+    assert plugin.bridge.match_rule(mismatched, [rule, other]) is None
+    assert not plugin.bridge.parsed_data(rule, mismatched)["episode_key"]
+
+
+async def test_labeled_range_reindexes_v050_history_without_consuming_the_last_episode(plugin):
+    from module.conf import settings
+    from module.database import Database
+    from module.models import Bangumi, Torrent
+
+    from review_gate.versions import version_traits
+
+    settings.rss_parser.filter = []
+    async with Database() as db:
+        rule = Bangumi(
+            official_title="主播女孩重度依赖", title_raw="NEEDY GIRL OVERDOSE", filter=""
+        )
+        db.add(rule)
+        await db.session.flush()
+        old = Torrent(
+            name=NEEDY, url="magnet:?pack-already-downloaded", downloaded=True, bangumi_id=rule.id
+        )
+        db.add(old)
+        await db.commit()
+    # v0.5.0 persisted "[01-13话]" as single episode 13.
+    legacy = {
+        "episode": 13,
+        "episode_end": None,
+        "revision": 1,
+        "group": "LoliHouse",
+        "resolution": "1080p",
+        "source": "WebRip",
+        "subtitle": "简繁内封字幕",
+    }
+    single_version = version_traits({**legacy, "name": NEEDY})[0]
+    legacy["episode_key"] = json.dumps(
+        [rule.official_title, "episode", 1, 13, single_version, None], ensure_ascii=False
+    )
+    await plugin.store.seed(plugin.bridge.rule_data(rule), plugin.bridge.torrent_data(old), legacy)
+    await plugin.bridge.sync_history()
+    [option] = variants(await plugin.store.candidates(rule.id))
+    assert option["kind"] == "batch" and option["ranges"] == [(1, 13)]
+    with sqlite3.connect(plugin.store.path) as db:
+        [row] = db.execute("SELECT episode_key FROM delivered").fetchall()
+    assert json.loads(row[0])[3:] == [1, option["id"], 13]
+    normal = Torrent(name=NEEDY.replace("[01-13话]", "- 13"), url="magnet:?single-13")
+    mirror = Torrent(name=NEEDY.replace("[01-13话]", "[01-13]"), url="magnet:?pack-mirror")
+    await plugin.bridge.capture(rule, normal)
+    await plugin.bridge.capture(rule, mirror)
+    await plugin.store.set_policy(rule.id, Policy(version_ids=[single_version, option["id"]]), 0)
+    await plugin.bridge.replay()
+    assert [c.args[0] for c in plugin.test_send.call_args_list] == ["magnet:?single-13"]
+
+
+@pytest.mark.parametrize("v1_downloaded", [False, True])
+async def test_spaced_revision_rejoins_the_same_rule_and_uses_history(plugin, v1_downloaded):
+    from module.conf import settings
+    from module.database import Database
+    from module.models import Bangumi, Torrent
+
+    settings.rss_parser.filter = []
+    original = Torrent(
+        name=REZERO.format(""), url="magnet:?rezero-original", downloaded=v1_downloaded
+    )
+    v2 = Torrent(name=REZERO.format(" v2"), url="magnet:?rezero-v2")
+    async with Database() as db:
+        rule = Bangumi(
+            official_title="Re:从零开始的异世界生活",
+            title_raw="Re: Re:Zero kara Hajimeru Isekai Seikatsu",
+            group_name="百冬练习组&LoliHouse",
+            season=4,
+            episode_offset=-66,
+            filter="",
+        )
+        db.add(rule)
+        await db.session.flush()
+        original.bangumi_id = rule.id
+        db.add(original)
+        db.add(v2)
+        await db.commit()
+    await plugin.bridge.capture(rule, original)
+    [option] = variants(await plugin.store.candidates(rule.id))
+    await plugin.store.set_policy(rule.id, Policy(version_ids=[option["id"]]), 0)
+    await plugin.bridge.replay()
+    candidates = await plugin.store.candidates(rule.id)
+    assert {c["revision"] for c in candidates} == {1, 2}
+    assert len({c["episode_key"] for c in candidates}) == 1
+    assert json.loads(candidates[0]["episode_key"])[2:4] == [4, 15]
+    assert {c["name"] for c in candidates} == {original.name, v2.name}
+    [policy] = await plugin.store.rules(rule.id)
+    assert policy["state"] == "approved" and policy["policy"]["version_ids"] == [option["id"]]
+    assert [c.args[0] for c in plugin.test_send.call_args_list] == (
+        [] if v1_downloaded else ["magnet:?rezero-v2"]
+    )
+
+
+@pytest.mark.parametrize("exclusion", ["global", "rule"])
+@pytest.mark.parametrize("name, pattern", [(NEEDY, r"13话"), (REZERO.format(" v2"), r"81\s+v2")])
+async def test_orphan_reports_filter_for_corrected_release_without_normalizing_regex(
+    plugin, rule, name, pattern, exclusion
+):
+    from module.conf import settings
+    from module.database import Database
+    from module.models import Torrent
+
+    settings.rss_parser.filter = [pattern] if exclusion == "global" else []
+    async with Database() as db:
+        current = await db.bangumi.search_id(rule.id)
+        current.title_raw = (
+            "NEEDY GIRL OVERDOSE" if name == NEEDY else "Re: Re:Zero kara Hajimeru Isekai Seikatsu"
+        )
+        current.filter = pattern if exclusion == "rule" else ""
+        db.add(current)
+        db.add(Torrent(name=name, url="magnet:?fixture"))
+        await db.commit()
+    [row] = await plugin.bridge.orphan_records()
+    assert row["name"] == name and row["rule_id"] == rule.id and not row["repairable"]
+    assert row["reason"] == (
+        "被 AB 全局过滤条件排除" if exclusion == "global" else "被 AB 单番过滤条件排除"
+    )
+    assert not (await plugin.bridge.repair_orphans())["repaired"]
+    plugin.test_send.assert_not_called()
+
+
+@pytest.mark.parametrize("manual", [False, True])
+@pytest.mark.parametrize("mode", ["backlog", "future"])
+async def test_orphan_repair_obeys_existing_approval_and_start_mode(plugin, rule, manual, mode):
+    from module.database import Database
+
+    item = release(url="magnet:?previously-seen-by-ab")
+    async with Database() as db:
+        db.add(item)
+        await db.commit()
+    await plugin.store.register(plugin.bridge.rule_data(rule))
+    await plugin.store.set_policy(
+        rule.id, Policy(unfiltered=True, mode=mode, cutoff=time.time()), 0
+    )
+    result = await plugin.bridge.repair_orphans({item.id} if manual else None)
+    assert result["repaired"] == [item.id]
+    [policy] = await plugin.store.rules(rule.id)
+    assert policy["state"] == ("pending" if manual else "approved")
+    assert policy["policy"]["mode"] == mode
+    await plugin.bridge.replay()
+    assert plugin.test_send.call_count == int(not manual and mode == "backlog")
