@@ -1,3 +1,6 @@
+import asyncio
+import json
+
 import pytest
 from conftest import release
 from fastapi import FastAPI
@@ -54,6 +57,106 @@ async def test_changed_candidates_invalidate_preview(plugin, rule, api):
             json={"preview_token": result.json()["preview_token"]},
         )
         assert response.status_code == 409
+
+
+async def test_read_versions_during_maintenance_and_find_newly_allowed_orphan(plugin, rule, api):
+    from module.database import Database
+
+    torrent = release(2, "AVC")
+    async with Database() as db:
+        stored = await db.bangumi.search_id(rule.id)
+        stored.filter = "AVC"
+        db.add(stored)
+        db.add(torrent)
+        await db.commit()
+    async with api:
+        # A read while the maintenance lock is held must finish without writing.
+        async with plugin.bridge.lock, asyncio.timeout(2):
+            result = await api.get(f"/review/rules/{rule.id}/versions")
+        assert result.status_code == 200, result.text
+        assert result.json()["rule"]["state"] == "pending"
+        assert not result.json()["versions"]
+        assert not await plugin.store.rules(rule.id)
+        async with Database() as db:
+            assert (await db.torrent.search(torrent.id)).bangumi_id is None
+            stored = await db.bangumi.search_id(rule.id)
+            stored.filter = ""
+            db.add(stored)
+            await db.commit()
+
+        await plugin.bridge.replay()
+        result = await api.get(f"/review/rules/{rule.id}/versions")
+        assert result.status_code == 200
+        assert result.json()["versions"][0]["codec"] == "AVC"
+    plugin.test_send.assert_not_called()
+
+
+async def test_offset_change_blocks_old_preview_until_background_sync(plugin, rule, api):
+    from module.database import Database
+
+    await plugin.bridge.capture(rule, release(12))
+    async with api:
+        preview = await api.post(f"/review/rules/{rule.id}/preview", json={"unfiltered": True})
+        assert preview.status_code == 200, preview.text
+        async with Database() as db:
+            stored = await db.bangumi.search_id(rule.id)
+            stored.episode_offset = -10
+            db.add(stored)
+            await db.commit()
+        versions = (await api.get(f"/review/rules/{rule.id}/versions")).json()
+        assert versions["needs_sync"] and not versions["versions"]
+        confirmed = await api.post(
+            f"/review/rules/{rule.id}/approve",
+            json={"preview_token": preview.json()["preview_token"]},
+        )
+        assert confirmed.status_code == 409
+
+        await plugin.bridge.replay()
+        versions = (await api.get(f"/review/rules/{rule.id}/versions")).json()
+        assert not versions["needs_sync"]
+        assert versions["rule"]["episode_offset"] == -10
+        [candidate] = await plugin.store.candidates(rule.id)
+        assert json.loads(candidate["episode_key"])[-1] == 2
+    plugin.test_send.assert_not_called()
+
+
+async def test_same_show_download_after_preview_requires_new_confirmation(plugin, rule, api):
+    from module.database import Database
+    from module.models import Bangumi
+
+    await plugin.bridge.capture(rule, release())
+    async with api:
+        path = f"/review/rules/{rule.id}"
+        options = {"unfiltered": True}
+        preview = (await api.post(f"{path}/preview", json=options)).json()
+        assert preview["will_download"] == 1
+        async with Database() as db:
+            sibling = Bangumi(
+                official_title=rule.official_title,
+                title_raw=rule.title_raw,
+                season=rule.season,
+                group_name="Other",
+            )
+            db.add(sibling)
+            await db.session.flush()
+            downloaded = release(variant="AVC")
+            downloaded.bangumi_id = sibling.id
+            downloaded.downloaded = True
+            db.add(downloaded)
+            await db.commit()
+        confirmed = await api.post(
+            f"{path}/approve", json={"preview_token": preview["preview_token"]}
+        )
+        assert confirmed.status_code == 409
+        preview = (await api.post(f"{path}/preview", json=options)).json()
+        assert preview["will_download"] == 0
+        assert preview["items"][0]["reason"] == "该集已有下载记录"
+        confirmed = await api.post(
+            f"{path}/approve", json={"preview_token": preview["preview_token"]}
+        )
+        assert confirmed.status_code == 200, confirmed.text
+    await plugin.bridge.replay()
+    plugin.test_send.assert_not_called()
 
 
 async def test_empty_include_rejected_and_urls_redacted(plugin, rule, api):

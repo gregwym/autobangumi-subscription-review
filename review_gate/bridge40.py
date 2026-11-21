@@ -232,9 +232,16 @@ class Bridge40:
         title = release and (release.title_en or release.title_zh or release.title_jp)
         ranked = []
         for rule in rules:
-            if not match_bangumi_in_list(name, [rule]):
+            if rule.deleted:
                 continue
-            length = max(len(p) for p in _all_title_patterns(rule) if p in name or p == title)
+            # The host uses the same title predicate. Skip rules it cannot match
+            # before calling a helper that re-parses the release on each call.
+            length = max(
+                (len(p) for p in _all_title_patterns(rule) if p in name or p == title),
+                default=0,
+            )
+            if not length or not match_bangumi_in_list(name, [rule]):
+                continue
             group = release.group if release else None
             exact = bool(
                 group
@@ -317,6 +324,38 @@ class Bridge40:
             "season_offset",
         )
         return {k: getattr(rule, k, None) for k in fields}
+
+    async def current_rule(self, rid):
+        from module.database import Database
+
+        async with Database() as db:
+            rule = await db.bangumi.search_id(rid)
+            return self.rule_data(rule) if rule is not None and not rule.deleted else None
+
+    async def sync_show_downloads(self, title):
+        """Refresh dedup for this title, including downloads from other rules."""
+        from module.database import Database
+        from module.models import Bangumi, Torrent
+        from sqlmodel import col, select
+
+        async with Database() as db:
+            statement = (
+                select(Torrent, Bangumi)
+                .join(Bangumi, col(Bangumi.id) == col(Torrent.bangumi_id))
+                .where(
+                    Bangumi.official_title == title,
+                    col(Bangumi.deleted).is_(False),
+                    col(Torrent.downloaded).is_(True),
+                )
+            )
+            rows = (await db.session.execute(statement)).all()
+        entries = [
+            (self.rule_data(rule), self.torrent_data(t), self.parsed_data(rule, t.name), True)
+            for t, rule in rows
+        ]
+        if entries:
+            await self.store.import_history([], entries)
+        return {p["episode_key"] for _, _, p, _ in entries if p["episode_key"]}
 
     @staticmethod
     def torrent_data(torrent):
@@ -567,22 +606,15 @@ class Bridge40:
                 await db.begin_write()
                 rules = await db.bangumi.search_all()
                 active = {r.id for r in rules if not r.deleted}
-                all_torrents = await db.torrent.search_all()
+                downloads_by_url = {}
+                for row in await db.torrent.search_all():
+                    if row.downloaded and row.bangumi_id in active:
+                        downloads_by_url.setdefault(row.url, row)
                 engine = RSSEngine(db)
                 for torrent in await db.torrent.search_orphans():
                     if ids is not None and torrent.id not in ids:
                         continue
-                    duplicate = next(
-                        (
-                            r
-                            for r in all_torrents
-                            if r.id != torrent.id
-                            and r.url == torrent.url
-                            and r.downloaded
-                            and r.bangumi_id in active
-                        ),
-                        None,
-                    )
+                    duplicate = downloads_by_url.get(torrent.url)
                     if duplicate and not torrent.downloaded:
                         if backup is None:
                             backup = str(await asyncio.to_thread(self.maintenance().backup))

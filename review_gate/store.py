@@ -216,19 +216,26 @@ class Store:
 
         return await self.call(read)
 
-    async def rules(self):
+    async def rules(self, rid=None):
         def read(db):
+            query = """
+                SELECT r.*, (SELECT COUNT(*) FROM candidates WHERE rule_id=r.id) AS candidate_count
+                FROM rules r
+            """
+            rows = (
+                db.execute(query + " WHERE r.id=?", (rid,))
+                if rid is not None
+                else db.execute(query + " ORDER BY r.id DESC")
+            )
             return [
                 {
                     **json.loads(r["payload"]),
                     "state": r["state"],
                     "revision": r["revision"],
                     "policy": json.loads(r["policy"]) if r["policy"] else None,
-                    "count": db.execute(
-                        "SELECT COUNT(*) FROM candidates WHERE rule_id=?", (r["id"],)
-                    ).fetchone()[0],
+                    "count": r["candidate_count"],
                 }
-                for r in db.execute("SELECT * FROM rules ORDER BY id DESC")
+                for r in rows
             ]
 
         return await self.call(read)

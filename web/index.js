@@ -53,14 +53,14 @@ class Detail extends HTMLElement {
     this.shadowRoot.innerHTML = `<style>${css}</style>
       <p class="muted">可多选下载版本，命中任一版本即可；同一集只下载一次。</p>
       <div id="notice" class="notice" hidden></div><div id="choices" class="choices"></div>
-      <fieldset id="mode" class="start-mode">
+      <fieldset id="mode" class="start-mode" disabled>
         <legend>开始方式</legend>
         <div class="start-options">
           <label class="choice"><input type="radio" name="mode" value="backlog" checked>补下已发现的缺集</label>
           <label class="choice"><input type="radio" name="mode" value="future">只追后续新发布</label>
         </div>
       </fieldset>
-      <details><summary>高级设置</summary>
+      <details id="advanced"><summary>高级设置</summary>
         <label class="field">从第几集开始<input id="episode" type="number" min="0" max="100000" step="0.5" value="1"></label>
         <label><input id="custom" type="checkbox"> 自定义版本条件</label>
         <label id="include-field" class="field" hidden>必须包含（每行一项，全部匹配）<textarea id="include"></textarea></label>
@@ -84,10 +84,19 @@ class Detail extends HTMLElement {
   error(e) {this.$('message').textContent = e.message || String(e); this.$('message').className = 'error';}
   async load() {
     this.invalidate(); const serial = this.serial;
+    clearTimeout(this.timer);
+    this.data = null;
+    this.$('mode').disabled = true;
+    this.$('refresh').disabled = true;
+    this.$('message').className = '';
+    this.$('message').textContent = '正在读取版本…';
     try {
       const data = await this.host.api.get(`rules/${this.rid}/versions`);
       if (!this.isConnected || serial !== this.serial) return;
       this.data = data; this.selected = new Set(); this.unfiltered = false;
+      this.$('mode').disabled = Boolean(data.needs_sync);
+      this.$('choices').hidden = Boolean(data.needs_sync);
+      this.$('advanced').hidden = Boolean(data.needs_sync);
       const p = data.rule.policy || {};
       const mode = p.mode === 'future' ? 'future' : 'backlog';
       for (const input of this.$('mode').querySelectorAll('input')) input.checked = input.value === mode;
@@ -119,11 +128,15 @@ class Detail extends HTMLElement {
       this.$('custom').checked = Boolean(p.include?.length && !this.selected.size);
       this.$('include-field').hidden = !this.$('custom').checked;
       this.$('message').className = '';
-      this.$('message').textContent = data.versions.length ? '请选择要追的版本。' : '尚未发现可选版本。RSS 更新后可刷新；也可在高级设置中自定义条件。';
+      this.$('message').textContent = data.needs_sync
+        ? '番剧规则已变化，请等待后台同步后刷新版本。'
+        : data.versions.length ? '请选择要追的版本。' : '尚未发现可选版本。后台收集候选后可刷新；也可在高级设置中自定义条件。';
       if (this.selected.size || this.unfiltered || this.$('custom').checked) this.schedule();
     } catch (e) {if (serial === this.serial) this.error(e);}
+    finally {if (this.isConnected) this.$('refresh').disabled = false;}
   }
   schedule() {
+    if (!this.data || this.data.needs_sync) return;
     this.invalidate(); clearTimeout(this.timer);
     this.$('exclude').disabled = this.unfiltered && !this.$('custom').checked;
     this.$('message').className = ''; this.$('message').textContent = '正在检查匹配集数…';
