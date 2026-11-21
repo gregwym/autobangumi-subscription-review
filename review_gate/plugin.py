@@ -35,7 +35,7 @@ class ReviewRequest(BaseModel):
 
 
 class HistoryRequest(BaseModel):
-    episodes: list[float] = Field(min_length=1, max_length=2000)
+    episodes: list[float | str] = Field(min_length=1, max_length=2000)
 
 
 class OrphanRequest(BaseModel):
@@ -46,8 +46,18 @@ class ApprovalRequest(BaseModel):
     preview_token: str = Field(min_length=20, max_length=100)
 
 
-def snapshot(revision, candidates, downloaded):
-    rows = [(c["id"], c["name"], c["status"], c["episode_key"] in downloaded) for c in candidates]
+def snapshot(revision, candidates, downloaded, exclusion):
+    rows = [
+        (
+            c["id"],
+            c["name"],
+            c["status"],
+            c["episode_key"],
+            c["episode_key"] in downloaded,
+            exclusion(c["name"]),
+        )
+        for c in candidates
+    ]
     return hashlib.sha256(json.dumps([revision, rows], sort_keys=True).encode()).hexdigest()
 
 
@@ -107,17 +117,19 @@ class SubscriptionReview(Plugin):
             if current is None:
                 raise HTTPException(404, "未找到番剧规则")
             rows = await self.store.rules(rid)
-            return current, rows[0] if rows else None
+            rule, rule_filter = current
+            return rule, rule_filter, rows[0] if rows else None
 
         async def prepare_review(rid, *, register=False):
-            current, rule = await read_review_rule(rid)
+            current, rule_filter, rule = await read_review_rule(rid)
             if rule is None and register:
                 await self.store.register(current)
                 rule = await find_rule(rid)
             if rule is None or fingerprint(current) != fingerprint(rule):
                 raise HTTPException(409, "番剧规则已变化，请等待后台同步后刷新版本")
             downloaded = await self.bridge.sync_show_downloads(current["official_title"])
-            return rule, await self.store.candidates(rid), downloaded
+            items = await self.store.candidates(rid)
+            return rule, items, downloaded, self.bridge.exclusion_check(rule_filter)
 
         @router.get("/update")
         async def update_status():
@@ -151,7 +163,7 @@ class SubscriptionReview(Plugin):
 
         @router.get("/rules/{rid}/versions")
         async def versions(rid: int):
-            current, stored = await read_review_rule(rid)
+            current, _, stored = await read_review_rule(rid)
             needs_sync = stored is not None and fingerprint(current) != fingerprint(stored)
             rule = (
                 {**current, "state": "pending", "policy": None, "count": 0}
@@ -187,7 +199,7 @@ class SubscriptionReview(Plugin):
         @router.post("/rules/{rid}/preview")
         async def preview(rid: int, body: ReviewRequest):
             async with self.bridge.lock:
-                rule, items, downloaded = await prepare_review(rid, register=True)
+                rule, items, downloaded, exclusion = await prepare_review(rid, register=True)
                 data = body.model_dump(exclude={"version_id"})
                 if body.unfiltered and (
                     body.version_id or body.version_ids or body.include or body.exclude
@@ -225,21 +237,31 @@ class SubscriptionReview(Plugin):
                     "rid": rid,
                     "policy": policy,
                     "revision": rule["revision"],
-                    "snapshot": snapshot(rule["revision"], items, downloaded),
+                    "snapshot": snapshot(rule["revision"], items, downloaded, exclusion),
                     "expires": time.time() + 600,
                 }
-                rows, episodes = [], set()
+                rows, scheduled = [], set()
+                counts = {"single": 0, "batch": 0, "feature": 0}
                 for c in items:
-                    reason = await self.store.decision(c, override=policy)
-                    if reason is None and c["episode_key"] in episodes:
-                        reason = "同集重复候选，保留先出现的匹配版本"
+                    reason = await self.store.decision(c, override=policy, exclusion=exclusion)
+                    if reason is None and c["episode_key"] in scheduled:
+                        reason = "同版本重复候选，保留一份"
                     if reason is None:
-                        episodes.add(c["episode_key"])
+                        scheduled.add(c["episode_key"])
+                        kind = (
+                            "batch"
+                            if c.get("episode_end") is not None
+                            else "feature"
+                            if c.get("feature")
+                            else "single"
+                        )
+                        counts[kind] += 1
                     rows.append({"id": c["id"], "name": c["name"], "reason": reason})
                 return {
                     "preview_token": token,
                     "items": rows,
-                    "will_download": sum(r["reason"] is None for r in rows),
+                    "will_download": sum(counts.values()),
+                    "download_counts": counts,
                     "policy": policy.dump(),
                 }
 
@@ -251,8 +273,8 @@ class SubscriptionReview(Plugin):
                 receipt = self.previews.pop(body.preview_token, None)
                 if not receipt or receipt["rid"] != rid or receipt["expires"] < time.time():
                     raise HTTPException(409, "预览已失效，请重新预览")
-                rule, items, downloaded = await prepare_review(rid)
-                if snapshot(rule["revision"], items, downloaded) != receipt["snapshot"]:
+                rule, items, downloaded, exclusion = await prepare_review(rid)
+                if snapshot(rule["revision"], items, downloaded, exclusion) != receipt["snapshot"]:
                     raise HTTPException(409, "候选、规则或下载历史已变化，请重新预览")
                 await self.store.set_policy(rid, receipt["policy"], receipt["revision"])
                 self.audit.emit(

@@ -146,7 +146,7 @@ async def test_hibike_missing_resolution_and_season_episode_ambiguity(plugin, ru
         name = f"[北宇治字幕组] 吹响吧！上低音号 第三季 / Hibike! Euphonium 3 [{ep:02}][WebRip][HEVC_AAC][简繁日内封][招募时轴]"
         parsed = plugin.bridge.parsed_data(rule, name)
         assert parsed["episode"] == ep
-        assert json.loads(parsed["episode_key"])[-2:] == [3, ep]
+        assert json.loads(parsed["episode_key"])[2:4] == [3, ep]
         items.append({"name": name, **parsed})
     versions = variants(items)
     assert len(versions) == 1
@@ -242,8 +242,8 @@ async def test_offset_edit_reindexes_history_and_retains_retry(plugin, rule):
         reservations = [
             json.loads(r[0]) for r in db.execute("SELECT episode_key FROM reservations")
         ]
-    assert keys == [[rule.official_title, "episode", 2, 1]]
-    assert reservations == [[rule.official_title, "episode", 2, 2]]
+    assert [key[:4] for key in keys] == [[rule.official_title, "episode", 2, 1]]
+    assert [key[:4] for key in reservations] == [[rule.official_title, "episode", 2, 2]]
     assert (await plugin.store.candidate(retry_id))["status"] == "retry"
     assert (await plugin.store.rules())[0]["state"] == "pending"
     assert [e["episode"] for e in plugin.bridge.maintenance().history(rule.id)["episodes"]] == [1]

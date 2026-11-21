@@ -51,7 +51,7 @@ class Detail extends HTMLElement {
   connectedCallback() {
     if (!this.shadowRoot) this.attachShadow({mode:'open'});
     this.shadowRoot.innerHTML = `<style>${css}</style>
-      <p class="muted">可多选下载版本，命中任一版本即可；同一集只下载一次。</p>
+      <p class="muted">单集、合集和单片可分别选择。每个所选版本独立去重。</p>
       <div id="notice" class="notice" hidden></div><div id="choices" class="choices"></div>
       <fieldset id="mode" class="start-mode" disabled>
         <legend>开始方式</legend>
@@ -61,7 +61,7 @@ class Detail extends HTMLElement {
         </div>
       </fieldset>
       <details id="advanced"><summary>高级设置</summary>
-        <label class="field">从第几集开始<input id="episode" type="number" min="0" max="100000" step="0.5" value="1"></label>
+        <label class="field">从第几集开始<input id="episode" type="number" min="0" max="100000" step="0.5" value="1"><small>合集按第一集判断，单片没有集数限制。</small></label>
         <label><input id="custom" type="checkbox"> 自定义版本条件</label>
         <label id="include-field" class="field" hidden>必须包含（每行一项，全部匹配）<textarea id="include"></textarea></label>
         <label class="field">排除（每行一项，任一匹配即跳过）<textarea id="exclude"></textarea></label>
@@ -109,7 +109,7 @@ class Detail extends HTMLElement {
       this.$('choices').replaceChildren();
       const any = document.createElement('label'); any.className = 'choice';
       const anyRadio = document.createElement('input'); anyRadio.type = 'checkbox'; anyRadio.name = 'unfiltered';
-      const anyText = document.createElement('div'); anyText.innerHTML = '<strong>不过滤版本，沿用 AB 规则</strong><small>不限定字幕组、清晰度、字幕或编码；同集只下载一次，仍遵守 AB 的过滤设置。</small>';
+      const anyText = document.createElement('div'); anyText.innerHTML = '<strong>单集不过滤版本，沿用 AB 规则</strong><small>允许所有符合 AB 过滤条件的单集版本。合集和单片可单独勾选。</small>';
       if (p.unfiltered) {anyRadio.checked = true; this.unfiltered = true;}
       anyRadio.onchange = () => {this.unfiltered = anyRadio.checked; this.selected.clear(); this.$('choices').querySelectorAll('input[name=version]').forEach(i => {i.checked = false;}); this.$('include').value = ''; this.$('exclude').value = ''; this.$('custom').checked = false; this.$('include-field').hidden = true; this.schedule();};
       any.append(anyRadio, anyText); this.$('choices').append(any);
@@ -118,9 +118,14 @@ class Detail extends HTMLElement {
         const radio = document.createElement('input'); radio.type = 'checkbox'; radio.name = 'version'; radio.value = v.id;
         const body = document.createElement('div'); const name = document.createElement('strong'); name.textContent = v.group; body.append(name);
         const tags = document.createElement('div'); tags.className = 'tags';
-        for (const text of [v.resolution || '清晰度未标注',v.source,v.codec,v.subtitle].filter(Boolean)) {const tag = document.createElement('span'); tag.className = 'tag'; tag.textContent = text; tags.append(tag);}
-        body.append(tags); const count = document.createElement('small'); count.textContent = `已发现 ${v.count} 集：${v.episodes.join("、")}`; body.append(count); body.title = v.example;
-        const same = p.version_ids?.length ? p.version_ids.includes(v.id) : p.version_id ? p.version_id === v.id : p.include?.length === v.include.length && p.include.every(t => v.include.some(x => x.toLowerCase() === t.toLowerCase()));
+        const kind = {batch:'合集', feature:'单片', single:'单集'}[v.kind] || '单集';
+        for (const text of [kind,v.resolution || '清晰度未标注',v.source,v.codec,v.subtitle].filter(Boolean)) {const tag = document.createElement('span'); tag.className = 'tag'; tag.textContent = text; tags.append(tag);}
+        body.append(tags); const count = document.createElement('small');
+        count.textContent = v.kind === 'batch'
+          ? `已发现 ${v.count} 个合集：${v.ranges.map(([start, end]) => `${start}–${end} 集`).join('、')}`
+          : v.kind === 'feature' ? '整部作品，无集号' : `已发现 ${v.count} 集：${v.episodes.join('、')}`;
+        body.append(count); body.title = v.example;
+        const same = p.version_ids?.length ? p.version_ids.includes(v.id) : p.version_id ? p.version_id === v.id : v.kind === 'single' && p.include?.length === v.include.length && p.include.every(t => v.include.some(x => x.toLowerCase() === t.toLowerCase()));
         if (same) {radio.checked = true; this.selected.add(v.id);}
         radio.onchange = () => {if (radio.checked) this.selected.add(v.id); else this.selected.delete(v.id); this.unfiltered = false; anyRadio.checked = false; this.$('include').value = v.include.join('\n'); this.$('custom').checked = false; this.$('include-field').hidden = true; this.schedule();};
         label.append(radio, body); this.$('choices').append(label);
@@ -155,7 +160,12 @@ class Detail extends HTMLElement {
       if (!this.isConnected || serial !== this.serial) return;
       this.token = result.preview_token;
       this.$('approve').disabled = !this.data.health.ready || this.busy;
-      this.$('message').textContent = body.mode === 'future' ? '仅下载确认后新发布的匹配集数。已有候选不会补下。' : `已发现的资源中将补下 ${result.will_download} 集；已下载的集数（含其他字幕组）会跳过。`;
+      const counts = result.download_counts;
+      const breakdown = [[counts?.single, '单集'], [counts?.batch, '合集'], [counts?.feature, '单片']]
+        .filter(([count]) => count).map(([count, label]) => `${count} 个${label}`).join('、');
+      this.$('message').textContent = body.mode === 'future'
+        ? '仅下载确认后匹配的新发布。已有候选不会补下。'
+        : `将下载 ${result.will_download} 个资源${breakdown ? `（${breakdown}）` : ''}。已下载的同版本资源会跳过。`;
       this.$('matches').replaceChildren();
       for (const item of result.items.slice(0,500)) {const row = document.createElement('div'); row.className = 'match'; row.textContent = `${item.name} · ${item.reason || '将下载'}`; this.$('matches').append(row);}
     } catch (e) {if (serial === this.serial) this.error(e);}
@@ -248,24 +258,24 @@ class History extends HTMLElement {
       this.$('episodes').replaceChildren();
       for (const ep of data.episodes) {
         const label = document.createElement('label'); label.className = 'choice';
-        const input = document.createElement('input'); input.type = 'checkbox'; input.value = ep.episode; input.onchange = () => this.invalidate();
-        const content = document.createElement('div'); const title = document.createElement('strong'); title.textContent = `第 ${ep.episode} 集`;
+        const input = document.createElement('input'); input.type = 'checkbox'; input.value = JSON.stringify(ep.selection); input.onchange = () => this.invalidate();
+        const content = document.createElement('div'); const title = document.createElement('strong'); title.textContent = ep.label;
         const details = document.createElement('small'); details.textContent = ep.names.join('\n') || '仅剩插件去重记录'; details.style.whiteSpace = 'pre-wrap';
         content.append(title, details); label.append(input, content); this.$('episodes').append(label);
       }
       this.$('preview').disabled = !data.episodes.length;
-      this.$('message').textContent = data.episodes.length ? `共 ${data.episodes.length} 集有下载历史。包括同番其他字幕组和已删除规则的记录。` : '没有已下载历史。';
+      this.$('message').textContent = data.episodes.length ? `共 ${data.episodes.length} 条下载历史。包括同番其他字幕组和已删除规则的记录。` : '没有已下载历史。';
     } catch (e) {this.$('message').textContent = e.message || String(e);}
   }
   async preview() {
-    const episodes = [...this.$('episodes').querySelectorAll('input:checked')].map(i => Number(i.value));
-    if (!episodes.length) {this.$('message').textContent = '请先勾选集数。'; return;}
+    const episodes = [...this.$('episodes').querySelectorAll('input:checked')].map(i => JSON.parse(i.value));
+    if (!episodes.length) {this.$('message').textContent = '请先勾选记录。'; return;}
     this.$('preview').disabled = true; const serial = this.serial;
     try {
       const data = await this.host.api.post(`rules/${this.rid}/history/preview`, {episodes});
       if (!this.isConnected || serial !== this.serial) return;
       this.token = data.preview_token; this.$('clear').hidden = false;
-      this.$('message').textContent = `将清除「${data.title}」第 ${data.episodes.map(e => e.episode).join('、')} 集的历史，并将 ${data.related_rules.length} 条相关规则转为待审核。确认后先备份，再清除；随后到“下载版本”选择版本和“补下已发现的缺集”。`;
+      this.$('message').textContent = `将清除「${data.title}」${data.episodes.map(e => e.label).join('、')}的历史，并将 ${data.related_rules.length} 条相关规则转为待审核。确认后备份并清除。`;
     } catch (e) {this.$('message').textContent = e.message || String(e);}
     finally {this.$('preview').disabled = false;}
   }
@@ -275,7 +285,7 @@ class History extends HTMLElement {
     try {
       const result = await this.host.api.post(`rules/${this.rid}/history/clear`, {preview_token:this.token});
       invalidateRules(); await this.load();
-      this.$('message').textContent = `已清除 ${result.cleared_episodes.length} 集历史。请重新选择下载版本。备份：${result.backup}`;
+      this.$('message').textContent = `已清除 ${result.cleared_episodes.length} 条历史。请重新选择下载版本。备份：${result.backup}`;
       this.host.toast('已清除历史，相关番剧等待重新选版本', 'info');
     } catch (e) {this.invalidate(); this.$('message').textContent = e.message || String(e);}
     finally {this.busy = false; this.$('clear').disabled = false; this.$('preview').disabled = false;}

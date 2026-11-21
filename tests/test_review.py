@@ -124,11 +124,11 @@ async def test_unparseable_collection_held(plugin, rule):
     plugin.test_send.assert_not_called()
 
 
-async def test_history_prevents_different_url_or_codec_redownload(plugin, rule):
+async def test_history_prevents_same_version_redownload_with_a_new_url(plugin, rule):
     from module.database import Database
     from module.downloader import DownloadClient
 
-    old = release(1, "AVC", "magnet:?old")
+    old = release(1, "HEVC", "magnet:?old")
     old.downloaded, old.bangumi_id = True, rule.id
     async with Database() as db:
         db.add(old)

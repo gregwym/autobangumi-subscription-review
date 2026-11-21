@@ -116,7 +116,7 @@ async def test_offset_change_blocks_old_preview_until_background_sync(plugin, ru
         assert not versions["needs_sync"]
         assert versions["rule"]["episode_offset"] == -10
         [candidate] = await plugin.store.candidates(rule.id)
-        assert json.loads(candidate["episode_key"])[-1] == 2
+        assert json.loads(candidate["episode_key"])[3] == 2
     plugin.test_send.assert_not_called()
 
 
@@ -139,7 +139,7 @@ async def test_same_show_download_after_preview_requires_new_confirmation(plugin
             )
             db.add(sibling)
             await db.session.flush()
-            downloaded = release(variant="AVC")
+            downloaded = release(url="magnet:?external")
             downloaded.bangumi_id = sibling.id
             downloaded.downloaded = True
             db.add(downloaded)
@@ -150,7 +150,7 @@ async def test_same_show_download_after_preview_requires_new_confirmation(plugin
         assert confirmed.status_code == 409
         preview = (await api.post(f"{path}/preview", json=options)).json()
         assert preview["will_download"] == 0
-        assert preview["items"][0]["reason"] == "该集已有下载记录"
+        assert preview["items"][0]["reason"] == "同版本已有下载记录"
         confirmed = await api.post(
             f"{path}/approve", json={"preview_token": preview["preview_token"]}
         )
@@ -259,7 +259,7 @@ async def test_history_api_preview_clear_lifecycle_and_secret_redaction(plugin, 
     plugin.test_send.assert_not_called()
 
 
-async def test_multi_version_or_semantics_and_cross_version_dedup(plugin, rule, api):
+async def test_multi_version_or_semantics_keeps_distinct_versions(plugin, rule, api):
     for ep, codec in [(1, "HEVC"), (1, "AVC"), (2, "AVC"), (3, "x265")]:
         await plugin.bridge.capture(rule, release(ep, codec))
     async with api:
@@ -269,7 +269,7 @@ async def test_multi_version_or_semantics_and_cross_version_dedup(plugin, rule, 
             f"/review/rules/{rule.id}/preview", json={"version_ids": ids, "mode": "backlog"}
         )
         assert preview.status_code == 200, preview.text
-        assert preview.json()["will_download"] == 2
+        assert preview.json()["download_counts"] == {"single": 3, "batch": 0, "feature": 0}
         response = await api.post(
             f"/review/rules/{rule.id}/approve",
             json={"preview_token": preview.json()["preview_token"]},
@@ -284,5 +284,5 @@ async def test_multi_version_or_semantics_and_cross_version_dedup(plugin, rule, 
         )
         assert unknown.status_code == 409
     await plugin.bridge.replay()
-    assert plugin.test_send.call_count == 2
+    assert plugin.test_send.call_count == 3
     assert "x265" not in str(plugin.test_send.call_args_list)

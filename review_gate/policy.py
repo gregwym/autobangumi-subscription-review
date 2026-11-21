@@ -47,20 +47,21 @@ class Policy:
         return self
 
     def reason(self, candidate: dict) -> str | None:
+        if not candidate.get("episode_key"):
+            return "不能可靠识别集数或合集范围；保持等待"
         if self.version_id or self.version_ids:
-            from .versions import variants
+            from .versions import version_traits
 
-            matches = variants([candidate])
-            if not matches or matches[0]["id"] not in (self.version_ids or [self.version_id]):
+            if version_traits(candidate)[0] not in (self.version_ids or [self.version_id]):
                 return "不是所选下载版本"
+        elif candidate.get("episode_end") is not None or candidate.get("feature"):
+            return "合集和单片需单独选择"
         name = candidate["name"].casefold()
         if not all(t.casefold() in name for t in self.include):
             return "缺少必须包含的关键词"
         if any(t.casefold() in name for t in self.exclude):
             return "命中排除关键词"
-        if not candidate.get("episode_key"):
-            return "不能可靠识别单集；保持等待"
-        if candidate["episode"] < self.from_episode:
+        if candidate["episode"] is not None and candidate["episode"] < self.from_episode:
             return "早于起始集数"
         if self.mode == "future" and candidate["first_seen"] <= self.cutoff:
             return "批准前已出现；仅追后续发布"

@@ -11,7 +11,6 @@ from pathlib import Path
 
 from .audit import Audit
 from .policy import Policy, candidate_id, fingerprint
-from .versions import variants
 
 
 class Store:
@@ -275,48 +274,46 @@ class Store:
             )
         )
 
-    async def decision(self, candidate, override=None):
+    async def decision(self, candidate, override=None, *, exclusion=None, scan_revisions=True):
         def read(db):
             row = db.execute("SELECT * FROM rules WHERE id=?", (candidate["rule_id"],)).fetchone()
             if not row or row["fingerprint"] != candidate.get("rule_fingerprint"):
                 return "规则身份已变化，请重新审核"
             if candidate["status"] in {"sent", "delivered"}:
                 return "已投递"
+            if exclusion and (reason := exclusion(candidate["name"])):
+                return reason
             if (
                 candidate.get("episode_key")
                 and db.execute(
                     "SELECT 1 FROM delivered WHERE episode_key=?", (candidate["episode_key"],)
                 ).fetchone()
             ):
-                return "该集已有下载记录"
+                return "同版本已有下载记录"
             reservation = db.execute(
                 "SELECT url FROM reservations WHERE episode_key=?", (candidate.get("episode_key"),)
             ).fetchone()
             if reservation and reservation[0] != candidate["url"]:
-                return "该集已有待确认投递；只重试原候选"
+                return "同版本已有待确认投递；只重试原候选"
             if override is None and (not row or row["state"] != "approved"):
                 return "等待版本审核"
             policy = override or Policy(**json.loads(row["policy"]))
             reason = policy.reason(candidate)
             if reason:
                 return reason
-            version = variants([candidate])
-            if version:
-                for other_row in db.execute(
-                    "SELECT * FROM candidates WHERE rule_id=?", (candidate["rule_id"],)
+            if reservation or not scan_revisions:
+                return None  # An uncertain send must retry the exact reserved URL.
+            for other_row in db.execute(
+                "SELECT * FROM candidates WHERE rule_id=?", (candidate["rule_id"],)
+            ):
+                other = self._unpack(other_row)
+                if (
+                    other.get("episode_key") == candidate.get("episode_key")
+                    and other.get("revision", 1) > candidate.get("revision", 1)
+                    and not (exclusion and exclusion(other["name"]))
+                    and not policy.reason(other)
                 ):
-                    other = self._unpack(other_row)
-                    if other.get("episode_key") != candidate.get("episode_key") or policy.reason(
-                        other
-                    ):
-                        continue
-                    other_version = variants([other])
-                    if (
-                        other_version
-                        and other_version[0]["id"] == version[0]["id"]
-                        and other.get("revision", 1) > candidate.get("revision", 1)
-                    ):
-                        return f"同版本已有 v{other['revision']} 修订，跳过旧版"
+                    return f"同版本已有 v{other['revision']} 修订，跳过旧版"
             return None
 
         return await self.call(read)
