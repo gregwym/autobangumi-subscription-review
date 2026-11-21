@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 
 from .audit import Audit
 from .bridge40 import PROVIDER, Bridge40
-from .policy import Policy
+from .policy import DEFAULT_MODE, Policy
 from .store import Store
 from .updater import Updater
 from .versions import variants
@@ -28,7 +28,7 @@ class ReviewRequest(BaseModel):
     include: list[str] = Field(default_factory=list, max_length=32)
     version_id: str | None = Field(default=None, max_length=40)
     exclude: list[str] = Field(default_factory=list, max_length=32)
-    mode: str = "future"
+    mode: str = DEFAULT_MODE
     from_episode: float = Field(default=1, ge=0, le=100000)
     unfiltered: bool = False
     version_ids: list[str] = Field(default_factory=list, max_length=100)

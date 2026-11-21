@@ -6,12 +6,14 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass, field
 
+DEFAULT_MODE = "backlog"
+
 
 @dataclass
 class Policy:
     include: list[str] = field(default_factory=list)
     exclude: list[str] = field(default_factory=list)
-    mode: str = "future"
+    mode: str = DEFAULT_MODE
     from_episode: float = 1
     cutoff: float = 0
     version_id: str | None = None

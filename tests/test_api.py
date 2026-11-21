@@ -11,23 +11,35 @@ def api(plugin):
     return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
 
 
-async def test_preview_then_approve_does_not_send_before_approval(plugin, rule, api):
+@pytest.mark.parametrize(
+    ("options", "mode", "expected"),
+    [
+        ({}, "backlog", 1),
+        ({"mode": "future"}, "future", 0),
+    ],
+)
+async def test_preview_then_approve_does_not_send_before_approval(
+    plugin, rule, api, options, mode, expected
+):
     await plugin.bridge.capture(rule, release())
     async with api:
         result = await api.post(
             f"/review/rules/{rule.id}/preview",
-            json={"include": ["HEVC", "1080p"], "mode": "backlog"},
+            json={"include": ["HEVC", "1080p"], **options},
         )
         assert result.status_code == 200, result.text
-        assert result.json()["will_download"] == 1
+        assert result.json()["policy"]["mode"] == mode
+        assert result.json()["will_download"] == expected
         plugin.test_send.assert_not_called()
         approved = await api.post(
             f"/review/rules/{rule.id}/approve",
             json={"preview_token": result.json()["preview_token"]},
         )
         assert approved.status_code == 200, approved.text
+        versions = await api.get(f"/review/rules/{rule.id}/versions")
+        assert versions.json()["rule"]["policy"]["mode"] == mode
     await plugin.bridge.replay()
-    assert plugin.test_send.call_count == 1
+    assert plugin.test_send.call_count == expected
 
 
 async def test_changed_candidates_invalidate_preview(plugin, rule, api):

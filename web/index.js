@@ -16,6 +16,8 @@ button{cursor:pointer}button:disabled{opacity:.45;cursor:default}.primary{backgr
 .muted,small{color:var(--ab-color-text-secondary,#777)}p{margin:8px 0 16px}.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .choices{display:grid;gap:8px;margin:16px 0}.choice{display:flex;align-items:start;gap:10px;padding:12px;border:1px solid #8884;border-radius:8px;cursor:pointer}.choice:has(input:checked){border-color:var(--ab-color-primary,#4f6bed);background:#6478ee0b}.choice input{margin-top:5px;accent-color:var(--ab-color-primary,#4f6bed)}.choice strong{display:block}.tags{display:flex;gap:6px;flex-wrap:wrap;margin-top:5px}.tag{padding:1px 7px;border-radius:4px;background:#8881;font-size:12px}
 label.field{display:grid;gap:6px;margin:12px 0}textarea{width:100%;min-height:72px}details{margin:16px 0}summary{cursor:pointer;color:var(--ab-color-text-secondary,#777)}.actions{margin-top:20px}.notice{padding:10px;background:#d99b1515;border-radius:6px}.error{color:#c14c38}#message{min-height:22px;margin-top:12px}.match{padding:8px 0;border-bottom:1px solid #8883;overflow-wrap:anywhere}#matches{max-height:260px;overflow:auto} [hidden]{display:none!important}
+.start-mode{border:0;padding:0;margin:12px 0;min-width:0}.start-mode legend{padding:0;margin-bottom:6px}
+.start-options{display:flex;gap:8px;flex-wrap:wrap}.start-options .choice{align-items:center;min-height:44px;padding:8px 12px}.start-options input{margin:0}
 `;
 const settingsCard = `
 :host{font-family:var(--ab-font-family,system-ui)}
@@ -51,7 +53,13 @@ class Detail extends HTMLElement {
     this.shadowRoot.innerHTML = `<style>${css}</style>
       <p class="muted">可多选下载版本，命中任一版本即可；同一集只下载一次。</p>
       <div id="notice" class="notice" hidden></div><div id="choices" class="choices"></div>
-      <label class="field">开始方式<select id="mode"><option value="future">只追后续新发布</option><option value="backlog">补下已发现的缺集</option></select></label>
+      <fieldset id="mode" class="start-mode">
+        <legend>开始方式</legend>
+        <div class="start-options">
+          <label class="choice"><input type="radio" name="mode" value="backlog" checked>补下已发现的缺集</label>
+          <label class="choice"><input type="radio" name="mode" value="future">只追后续新发布</label>
+        </div>
+      </fieldset>
       <details><summary>高级设置</summary>
         <label class="field">从第几集开始<input id="episode" type="number" min="0" max="100000" step="0.5" value="1"></label>
         <label><input id="custom" type="checkbox"> 自定义版本条件</label>
@@ -63,7 +71,8 @@ class Detail extends HTMLElement {
       <div id="message" role="status">正在读取版本…</div>`;
     this.$ = id => this.shadowRoot.getElementById(id);
     this.rid = Number(this.context?.bangumiId);
-    for (const id of ['mode','episode','include','exclude']) this.$(id).oninput = () => this.schedule();
+    this.$('mode').onchange = () => this.schedule();
+    for (const id of ['episode','include','exclude']) this.$(id).oninput = () => this.schedule();
     this.$('custom').onchange = () => {this.$('include-field').hidden = !this.$('custom').checked; this.schedule();};
     this.$('refresh').onclick = () => this.load();
     this.$('approve').onclick = () => this.mutate('approve', {preview_token:this.token});
@@ -80,7 +89,9 @@ class Detail extends HTMLElement {
       if (!this.isConnected || serial !== this.serial) return;
       this.data = data; this.selected = new Set(); this.unfiltered = false;
       const p = data.rule.policy || {};
-      this.$('mode').value = p.mode || 'future'; this.$('episode').value = p.from_episode ?? 1;
+      const mode = p.mode === 'future' ? 'future' : 'backlog';
+      for (const input of this.$('mode').querySelectorAll('input')) input.checked = input.value === mode;
+      this.$('episode').value = p.from_episode ?? 1;
       this.$('include').value = (p.include || []).join('\n'); this.$('exclude').value = (p.exclude || []).join('\n');
       this.$('hold').hidden = data.rule.state !== 'approved';
       this.$('approve').textContent = data.rule.state === 'approved' ? '保存版本' : '开始追番';
@@ -121,7 +132,7 @@ class Detail extends HTMLElement {
   async preview() {
     const serial = this.serial;
     const terms = id => this.$(id).value.split('\n').map(s => s.trim()).filter(Boolean);
-    const body = {exclude:terms('exclude'), mode:this.$('mode').value, from_episode:Number(this.$('episode').value)};
+    const body = {exclude:terms('exclude'), mode:this.$('mode').querySelector('input:checked').value, from_episode:Number(this.$('episode').value)};
     if (this.$('custom').checked) body.include = terms('include');
     else if (this.unfiltered) {body.unfiltered = true; body.exclude = [];}
     else if (this.selected.size) body.version_ids = [...this.selected];
