@@ -4,6 +4,7 @@ import asyncio
 import re
 import time
 from collections import Counter, defaultdict
+from urllib.parse import parse_qsl, urlsplit
 
 import httpx2
 from bs4 import BeautifulSoup
@@ -31,14 +32,44 @@ def release_page(url, homepage):
     return None
 
 
+def feed_series(url):
+    """Series identity of a dedicated Mikan feed, including whole-show feeds."""
+    try:
+        parts = urlsplit(url)
+        if (
+            parts.scheme != "https"
+            or parts.netloc not in {"mikanani.me", "mikanime.tv"}
+            or parts.path.lower() != "/rss/bangumi"
+            or parts.fragment
+        ):
+            return None
+        pairs = [(k.lower(), v) for k, v in parse_qsl(parts.query, keep_blank_values=True)]
+        params = dict(pairs)
+        if (
+            len(params) != len(pairs)
+            or set(params) not in ({"bangumiid"}, {"bangumiid", "subgroupid"})
+            or not all(re.fullmatch(r"[1-9]\d{0,9}", v) for v in params.values())
+        ):
+            return None
+        return int(params["bangumiid"])
+    except ValueError:
+        return None
+
+
 def page_series(data, expected_hash=None):
     soup = BeautifulSoup(data, "html.parser")
     links = soup.select("p.bangumi-title a[href]")
     if links:
-        matches = [SERIES_PATH.fullmatch(link["href"]) for link in links]
-        if all(matches) and len(ids := {int(match[1]) for match in matches}) == 1:
-            return ids.pop()
-        return None
+        title_ids, feed_ids = set(), set()
+        for link in links:
+            href = link["href"]
+            if match := SERIES_PATH.fullmatch(href):
+                title_ids.add(int(match[1]))
+            elif href.startswith("/RSS/") and (sid := feed_series("https://mikanani.me" + href)):
+                feed_ids.add(sid)
+            else:
+                return None
+        return next(iter(title_ids)) if len(title_ids) == 1 and feed_ids <= title_ids else None
     # Only an authenticated release identity (matching torrent hash in the
     # public page) can distinguish an unclassified post from a broken page.
     title = soup.select_one("#sk-container .episode-header .episode-title")
@@ -269,7 +300,21 @@ class MikanSeries:
         return rule
 
     def members(self, series, rules):
-        return [r for r in rules if not r.deleted and self.identity(r) == series]
+        def identifies(rule):
+            known = self.identity(rule)
+            if known is not None:
+                return known == series
+            # Accept a classified release into its dedicated single-series rule
+            # even before any torrent history exists. Keep persisted dedup keys
+            # unchanged until observe() verifies the rule's history.
+            ids = {
+                sid
+                for url in (getattr(rule, "rss_link", "") or "").split(",")
+                if (sid := feed_series(url))
+            }
+            return ids == {series}
+
+        return [r for r in rules if not r.deleted and identifies(r)]
 
     async def defer_creation(self, db, rules, item, torrent, series):
         from module.database.bangumi import _all_title_patterns

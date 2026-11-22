@@ -144,3 +144,42 @@ async def test_rss_batch_v1_before_v2_still_downloads_only_v2(plugin, rule, monk
     assert "magnet:?v2" in str(plugin.test_send.call_args)
     async with Database() as db:
         assert not await db.torrent.search_orphans()
+
+
+async def test_ordinary_mikan_feed_reaches_versions_on_scheduled_review(plugin, rule, monkeypatch):
+    from module.database import Database
+    from module.downloader import DownloaderPool
+    from module.models import RSSItem, Torrent
+    from module.rss import RSSEngine
+
+    from review_gate import mikan_series
+    from review_gate.versions import variants
+
+    install_hook(plugin)
+    digest = "a" * 40
+    item = Torrent(
+        name="[Other] Alternative Title - 01 [1080p HEVC]",
+        homepage=f"https://mikanani.me/Home/Episode/{digest}",
+        url=f"https://mikanani.me/Download/20260101/{digest}.torrent",
+    )
+    async with Database() as db:
+        rss = RSSItem(
+            url="https://mikanani.me/RSS/Bangumi?bangumiId=42&subgroupid=7", aggregate=False
+        )
+        rule.rss_link = rss.url
+        db.add(rss)
+        db.add(rule)
+        await db.commit()
+        item.rss_id = rss.id
+    monkeypatch.setattr(RSSEngine, "_get_torrents", staticmethod(AsyncMock(return_value=[item])))
+    monkeypatch.setattr(mikan_series, "fetch_series", AsyncMock(return_value=42))
+    async with Database() as db, DownloaderPool() as pool:
+        await RSSEngine(db).refresh_rss(pool)
+    await plugin.bridge.replay()
+    async with Database() as db:
+        [record] = await db.torrent.search_all()
+        assert record.bangumi_id == rule.id and not record.downloaded
+        assert len(await db.bangumi.search_all()) == 1
+    [version] = variants(await plugin.store.candidates(rule.id))
+    assert version["codec"] == "HEVC" and version["episodes"] == [1]
+    plugin.test_send.assert_not_called()

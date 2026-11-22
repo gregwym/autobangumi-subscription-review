@@ -638,6 +638,15 @@ class Bridge40:
             fields["episode"] = None
         fields["episode_key"] = None
         fields["episode_end"] = batch.episode_end if batch else None
+        if (
+            release
+            and rule.episode_type == "movie"
+            and release.media_type is MediaType.MOVIE
+            and release.release_kind is ReleaseKind.SINGLE
+            and release.episode is None
+            and file_range is None
+        ):
+            feature = True
         fields["feature"] = feature
         fields["file_special"] = file_special
         fields["resolution"] = fields["resolution"] or file_resolution

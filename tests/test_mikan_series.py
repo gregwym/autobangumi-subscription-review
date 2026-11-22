@@ -34,6 +34,11 @@ def test_series_uses_only_the_series_link_for_the_actual_release():
     assert page_series(page("/Home/Bangumi/37#28", "/Home/Bangumi/37#1")) == 37
     assert page_series(page("/Home/Bangumi/37", "/Home/Bangumi/51")) is None
     assert page_series(page("https://example.test/Home/Bangumi/37")) is None
+    icon = "/RSS/Bangumi?bangumiId=37&amp;subgroupid=28"
+    assert page_series(page("/Home/Bangumi/37#28", icon)) == 37
+    assert page_series(page("/Home/Bangumi/51", icon)) is None
+    assert page_series(page(icon)) is None
+    assert page_series(page("/Home/Bangumi/37", "https://example.test/Home/Bangumi/51")) is None
     a, b = torrent(1, "a"), torrent(2, "b")
     assert release_page(a.url, a.homepage) == a.homepage
     assert release_page(a.url, b.homepage) is None
@@ -347,3 +352,52 @@ async def test_unlisted_uses_exact_title_group_and_verified_episode_numbering(
     await gate.resolve(pack.homepage)
     assert gate.pages[key] == 23 and match(pack, [rule]) is None
     plugin.test_send.assert_not_called()
+
+
+async def test_first_classified_release_matches_a_dedicated_rule_before_binding(
+    plugin, rule, monkeypatch
+):
+    from module.database import Database
+    from module.rss import RSSEngine
+
+    from review_gate import mikan_series
+
+    gate = plugin.bridge.mikan
+    rss = "https://mikanani.me/RSS/Bangumi?bangumiId=17"
+    rule.rss_link = f"{rss}&subgroupid=3,{rss}&subgroupid=5"
+    release = torrent(87, "[Other Group] Another Title - 01 [1080p]")
+    monkeypatch.setattr(mikan_series, "fetch_series", AsyncMock(return_value=17))
+    async with Database() as db:
+        engine = RSSEngine(db)
+        assert engine.match_torrent(release, [rule]) is None
+        await gate.resolve(release.homepage)
+        assert engine.match_torrent(release, [rule]) == rule
+        assert gate.identity(rule) is None
+        for links in (
+            rss + "2",
+            rss + "," + rss + "2",
+            "https://mikanani.me/RSS/Search?searchstr=17",
+        ):
+            rule.rss_link = links
+            assert not gate.members(17, [rule])
+        rule.rss_link = rss
+        await gate.bind(rule, 0)
+        assert not gate.members(17, [rule])
+    plugin.test_send.assert_not_called()
+
+
+def test_movie_card_exposes_explicit_feature_only_and_requires_a_version(rule):
+    from review_gate.bridge40 import Bridge40
+
+    rule.episode_type = "movie"
+    name = "[Group] Example Movie [1080p HEVC]"
+    candidate = {**Bridge40.parsed_data(rule, name), "name": name, "first_seen": 1}
+    assert candidate["feature"] and candidate["episode_key"]
+    [version] = variants([candidate])
+    assert version["kind"] == "feature"
+    assert Policy(unfiltered=True).reason(candidate)
+    assert Policy(version_ids=[version["id"]]).reason(candidate) is None
+    for label in ("Example Movie PV", "Example Movie Trailer", "Example"):
+        assert not Bridge40.parsed_data(rule, f"[Group] {label} [1080p]")["feature"]
+    rule.episode_type = "episode"
+    assert not Bridge40.parsed_data(rule, name)["feature"]
