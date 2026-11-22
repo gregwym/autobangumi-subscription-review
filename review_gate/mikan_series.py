@@ -161,6 +161,40 @@ class MikanSeries:
     def members(self, series, rules):
         return [r for r in rules if not r.deleted and self.identity(r) == series]
 
+    async def defer_creation(self, db, rules, item, torrent, series):
+        from module.database.bangumi import _all_title_patterns
+        from module.models import Torrent
+        from sqlmodel import col, select
+
+        # Discovery is feed-scoped, but a release already owned by AB is not new.
+        owner = await db.session.scalar(
+            select(Torrent.bangumi_id)
+            .where(Torrent.url == torrent.url, col(Torrent.bangumi_id).is_not(None))
+            .limit(1)
+        )
+        if owner is not None:
+            return True
+        for rule in rules:
+            if rule.episode_type != item.episode_type or rule.season != item.season:
+                continue
+            identity = self.identity(rule)
+            if rule.deleted and identity == series:
+                return True
+            if identity not in (None, 0):
+                continue
+            if rule.official_title == item.official_title:
+                return True
+            if item.title_raw and item.title_raw in _all_title_patterns(rule):
+                # An exact alias is reason to verify the legacy releases, not to
+                # bind two series. Non-Mikan records supply no evidence to verify.
+                history = await db.torrent.search_by_bangumi_id(rule.id)
+                if any(release_page(t.url, t.homepage) for t in history) or any(
+                    release_page(c["url"], c.get("homepage"))
+                    for c in await self.store.candidates(rule.id)
+                ):
+                    return True
+        return False
+
     def match(self, torrent, rules, match_title, file_ranges):
         from module.database.bangumi import _release_matches_bangumi
         from module.parser.analyser.tokenizer.result import ReleaseKind
@@ -224,14 +258,7 @@ class MikanSeries:
             if rss.url not in (rule.rss_link or "").split(","):
                 rule.rss_link = ",".join(filter(None, (rule.rss_link, rss.url)))
         else:
-            # Do not resurrect deleted rules, or shadow an unresolved legacy rule.
-            if any(
-                r.official_title == item.official_title
-                and r.episode_type == item.episode_type
-                and r.season == item.season
-                and (self.identity(r) in (None, 0) or (r.deleted and self.identity(r) == series))
-                for r in rules
-            ):
+            if await self.defer_creation(engine.db, rules, item, torrent, series):
                 return True
             rule = item
         engine.db.add(rule)

@@ -210,3 +210,79 @@ async def test_duplicate_cards_and_review_only_candidates_get_backfilled_first(
     )
     assert set(seen[:3]) == {rows[8].homepage, rows[9].homepage, extra.homepage}
     assert len(seen) == 6 and extra.url not in series.owners
+
+
+@pytest.mark.parametrize("same_series", [True, False])
+async def test_cold_discovery_waits_for_the_series_behind_a_legacy_alias(
+    plugin, rule, monkeypatch, same_series
+):
+    from module.database import Database
+    from module.models import RSSItem
+    from module.rss import RSSEngine
+    from module.rss.analyser import RSSAnalyser
+
+    from review_gate import mikan_series
+
+    old = torrent(51, "[Group] Previous Title - 01 [1080p]")
+    new = torrent(52, "[Group] Release Alias - 02 [1080p]")
+    mapped = {old.homepage: 17, new.homepage: 17 if same_series else 23}
+    monkeypatch.setattr(mikan_series, "fetch_series", AsyncMock(side_effect=mapped.__getitem__))
+
+    async def enrich(_, bangumi, **kwargs):
+        bangumi.official_title = "別の表示名"
+
+    monkeypatch.setattr(RSSAnalyser, "official_title_parser", enrich)
+    async with Database() as db:
+        feed = RSSItem(url="https://example.test/reposted", aggregate=True)
+        db.add(feed)
+        rule.title_aliases = json.dumps(["Release Alias"])
+        db.add(rule)
+        old.bangumi_id = rule.id
+        db.add(old)
+        await db.commit()
+        analyser = RSSAnalyser()
+        engine = RSSEngine(db)
+        await analyser.rss_to_data(feed, [new], engine, [rule])
+        assert [r.id for r in await db.bangumi.search_all()] == [rule.id]
+        assert engine.match_torrent(new, [rule]) is None
+        await plugin.bridge.sync_history(inspect_files=True)
+        await analyser.rss_to_data(feed, [new], engine, [rule])
+        rules = await db.bangumi.search_all()
+        assert len(rules) == (1 if same_series else 2)
+        owner = engine.match_torrent(new, rules)
+        assert owner and (owner.id == rule.id) == same_series
+        assert plugin.bridge.mikan.identity(owner) == mapped[new.homepage]
+    plugin.test_send.assert_not_called()
+
+
+async def test_same_release_on_another_feed_never_creates_a_rule_during_backfill(
+    plugin, rule, monkeypatch
+):
+    from module.database import Database
+    from module.models import RSSItem
+    from module.rss import RSSEngine
+    from module.rss.analyser import RSSAnalyser
+
+    from review_gate import mikan_series
+
+    old = torrent(61, "[Group] Unrecorded Alias - 05 [1080p HEVC]")
+    old.bangumi_id = rule.id
+    old.downloaded = True
+    incoming = old.model_copy(update={"id": None, "bangumi_id": None, "downloaded": False})
+    monkeypatch.setattr(mikan_series, "fetch_series", AsyncMock(return_value=37))
+
+    async def enrich(_, bangumi, **kwargs):
+        bangumi.official_title = "別の表示名"
+
+    monkeypatch.setattr(RSSAnalyser, "official_title_parser", enrich)
+    async with Database() as db:
+        feed = RSSItem(url="https://example.test/second", aggregate=True)
+        db.add(feed)
+        db.add(old)
+        await db.commit()
+        engine = RSSEngine(db)
+        await RSSAnalyser().rss_to_data(feed, [incoming], engine, [rule])
+        assert [r.id for r in await db.bangumi.search_all()] == [rule.id]
+        assert plugin.bridge.mikan.identity(rule) is None
+        assert (await db.torrent.search(old.id)).downloaded
+    plugin.test_send.assert_not_called()
