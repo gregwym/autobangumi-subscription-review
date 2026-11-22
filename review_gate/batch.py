@@ -14,7 +14,7 @@ CROSS_SEASON = re.compile(
 EXTRAS = re.compile(r"(?i)\b(?:NCOP|NCED|OP|ED|OVA|OAD|PV|SP|MOVIE)\d*\b|特典|剧场版|劇場版")
 EPISODE_RANGE = re.compile(r"(?<![A-Za-z0-9])\d{1,4}\s*[-~–—]\s*\d{1,4}(?!\d)")
 LABELED_RANGE = re.compile(
-    r"[\[【]\s*(\d{1,4})\s*[-~～–—－]\s*(\d{1,4})(v[1-9]\d{0,2})?\s*[话話集]\s*[\]】]",
+    r"[\[【]\s*(\d{1,4})\s*[-~～–—－]\s*(\d{1,4})(v[1-9]\d{0,2})?\s*(?:[话話集]|合[集輯辑])\s*[\]】]",
     re.I,
 )
 SPACED_REVISION = re.compile(

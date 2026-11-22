@@ -428,3 +428,15 @@ async def test_orphan_repair_obeys_existing_approval_and_start_mode(plugin, rule
     assert policy["policy"]["mode"] == mode
     await plugin.bridge.replay()
     assert plugin.test_send.call_count == int(not manual and mode == "backlog")
+
+
+@pytest.mark.parametrize("label", ["合集", "合輯", "合辑"])
+def test_bracketed_collection_suffix_with_a_number_in_the_title(label):
+    from review_gate.batch import parsed_batch
+
+    name = f"[Group] 示例 0/Example Show 0 [01-24{label}][WebRip 1080p HEVC][Fin]"
+    release = parsed_batch(name)
+    assert release and (release.episode, release.episode_end) == (1, 24)
+    assert release.raw == name
+    assert parsed_batch(name.replace("01-24", "24-01")) is None
+    assert parsed_batch(name + "[NCOP]") is None
