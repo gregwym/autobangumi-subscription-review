@@ -535,7 +535,16 @@ class Bridge40:
         return {k: getattr(torrent, k, None) for k in ("name", "url", "homepage", "rss_id")}
 
     @staticmethod
-    def parsed_data(rule, name, *, feature=False, file_range=None, inspect_title=False):
+    def parsed_data(
+        rule,
+        name,
+        *,
+        feature=False,
+        file_range=None,
+        inspect_title=False,
+        file_special=None,
+        file_resolution=None,
+    ):
         from module.manager.revision_policy import _adjust_episode
         from module.parser.analyser.tokenizer.result import MediaType, ReleaseKind
         from module.parser.release_policy import preference_identity, preference_revision
@@ -579,7 +588,7 @@ class Bridge40:
         identity = preference_identity(release, default_season=rule.season) if release else None
         if (
             batch
-            and rule.episode_type == "episode"
+            and (rule.episode_type == "episode" or (file_range and rule.episode_type == "special"))
             and (batch.season is None or batch.season == rule.season)
         ):
             identity = (batch.media_type, rule.season, batch.episode)
@@ -605,6 +614,8 @@ class Bridge40:
         fields["episode_key"] = None
         fields["episode_end"] = batch.episode_end if batch else None
         fields["feature"] = feature
+        fields["file_special"] = file_special
+        fields["resolution"] = fields["resolution"] or file_resolution
         fields["revision"] = preference_revision(release) if release else 1
         bracket_revision = re.search(r"\[(\d{1,3}(?:\.5)?)v(\d+)\]", name, re.I)
         if identity and bracket_revision and float(bracket_revision[1]) == identity[2]:
@@ -630,11 +641,14 @@ class Bridge40:
         fp = fingerprint(self.rule_data(rule))
         feature = self.features.get(key) == fp
         proof = self.file_ranges.get(key)
+        content = proof[1] if proof and proof[0] == fp else None
         data = self.parsed_data(
             rule,
             name,
-            feature=feature,
-            file_range=proof[1] if proof and proof[0] == fp else None,
+            feature=feature or bool(content and content.special and content.span is None),
+            file_range=content.span if content else None,
+            file_special=content.special if content else None,
+            file_resolution=content.resolution if content else None,
             inspect_title=bool(TORRENT.fullmatch(url)),
         )
 
@@ -684,8 +698,8 @@ class Bridge40:
             history = await db.torrent.search_all()
             sources = {rss.id: dedicated_feed(rss.url) for rss in await db.rss.search_all()}
         by_id = {r.id: r for r in rules if not r.deleted}
-        await self.mikan.observe(by_id, history, inspect_files)
         retained = await self.store.candidates()
+        await self.mikan.observe(by_id, history, inspect_files, retained)
         records = [(t.bangumi_id, self.torrent_data(t)) for t in history] + [
             (c["rule_id"], c) for c in retained
         ]

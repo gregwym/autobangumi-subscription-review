@@ -133,11 +133,11 @@ class Detail extends HTMLElement {
         const body = document.createElement('div'); const name = document.createElement('strong'); name.textContent = v.group; body.append(name);
         const tags = document.createElement('div'); tags.className = 'tags';
         const kind = {batch:'合集', feature:'单片', single:'单集'}[v.kind] || '单集';
-        for (const text of [kind,v.resolution || '清晰度未标注',v.source,v.codec,v.subtitle].filter(Boolean)) {const tag = document.createElement('span'); tag.className = 'tag'; tag.textContent = text; tags.append(tag);}
+        for (const text of [kind,v.resolution || '清晰度未标注',v.source,v.codec,v.subtitle,v.special].filter(Boolean)) {const tag = document.createElement('span'); tag.className = 'tag'; tag.textContent = text; tags.append(tag);}
         body.append(tags); const count = document.createElement('small');
         count.textContent = v.kind === 'batch'
-          ? `已发现 ${v.count} 个合集：${v.ranges.map(([start, end]) => `${start}–${end} 集`).join('、')}`
-          : v.kind === 'feature' ? '整部作品，无集号' : `已发现 ${v.count} 集：${v.episodes.join('、')}`;
+          ? `已发现 ${v.count} 个合集：${v.ranges.map(([start, end]) => `${start}–${end} 集${v.special ? ' + ' + v.special : ''}`).join('、')}`
+          : v.kind === 'feature' ? (v.special ? '单独收录 ' + v.special : '整部作品，无集号') : `已发现 ${v.count} 集：${v.episodes.join('、')}`;
         body.append(count); body.title = v.example;
         const same = p.version_ids?.length ? p.version_ids.includes(v.id) : p.version_id ? p.version_id === v.id : v.kind === 'single' && p.include?.length === v.include.length && p.include.every(t => v.include.some(x => x.toLowerCase() === t.toLowerCase()));
         if (same) {radio.checked = true; this.selected.add(v.id);}

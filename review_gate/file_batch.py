@@ -4,12 +4,13 @@ import asyncio
 import re
 import time
 import unicodedata
+from dataclasses import dataclass
 from pathlib import PurePosixPath
 
 import httpx2
 
 from .batch import EXTRAS, SEASON, parse_review_release
-from .feature import dedicated_feed, normalized_title
+from .feature import SPECIAL_TITLE, dedicated_feed, normalized_title
 from .mikan_series import TORRENT, episode_hash, release_page
 
 LIMIT = 4 * 1024 * 1024
@@ -217,6 +218,77 @@ def episode_range(paths, name, rule, *, numbered_aliases=frozenset()):
     return None
 
 
+@dataclass(frozen=True)
+class FileContents:
+    span: tuple[int, int] | None = None
+    special: str | None = None
+    resolution: str | None = None
+
+
+def special_contents(paths, release, rule):
+    """Read explicit episode numbers and special labels from a verified release's manifest."""
+    from module.parser.analyser.tokenizer.result import MediaType, ReleaseKind
+
+    release_titles = {
+        normalized_title(t)
+        for t in (release.title_en, release.title_zh, release.title_jp, rule.official_title)
+    }
+    numbers, titles, resolutions, languages = set(), set(), set(), set()
+    special = None
+    for path in paths:
+        file = PurePosixPath(path)
+        stem = unicodedata.normalize("NFKC", file.stem)
+        item = parse_review_release(stem)[1]
+        if (
+            not item
+            or not item.primary_title
+            or item.release_kind is not ReleaseKind.SINGLE
+            or item.season not in (None, rule.season)
+            or any(SEASON.search(p) for p in file.parts[:-1])
+        ):
+            return None
+        title = normalized_title(GROUP.sub("", item.primary_title))
+        if not title or not any(
+            title == t or (len(title) >= 4 and title in t) for t in release_titles
+        ):
+            return None
+        titles.add(title)
+        if len(titles) > 1:
+            return None
+        if item.resolution:
+            resolutions.add(item.resolution.casefold())
+        if item.subtitle:
+            languages.add(item.subtitle.casefold())
+        if item.media_type in (MediaType.OVA, MediaType.OAD):
+            if special or item.episode is not None or not re.search(r"\[(OVA|OAD)\]", stem, re.I):
+                return None
+            special = item.media_type.value.upper()
+        elif item.media_type is MediaType.EPISODE and type(item.episode) is int:
+            markers = list(MARKER.finditer(stem))
+            if (
+                len(markers) != 1
+                or int(markers[0][1] or markers[0][2] or markers[0][4]) != item.episode
+                or item.episode in numbers
+                or EXTRAS.search(stem)
+            ):
+                return None
+            numbers.add(item.episode)
+        else:
+            return None
+    if (
+        len(resolutions) > 1
+        or len(languages) > 1
+        or (release.subtitle and languages and release.subtitle.casefold() not in languages)
+    ):
+        return None
+    resolution = next(iter(resolutions), None)
+    if special and len(paths) == 1:
+        return FileContents(special=special, resolution=resolution)
+    if len(numbers) >= 2 and max(numbers) - min(numbers) + 1 == len(numbers):
+        return FileContents((min(numbers), max(numbers)), special, resolution)
+    return None
+
+
 class FileBatches:
     def __init__(self, store):
         self.store = store
@@ -238,7 +310,7 @@ class FileBatches:
             match = TORRENT.fullmatch(url)
             if (
                 not rule
-                or rule.episode_type != "episode"
+                or rule.episode_type not in ("episode", "special")
                 or not match
                 or key in seen
                 or key in features
@@ -255,6 +327,9 @@ class FileBatches:
                 continue
             seen.add(key)
             release = parse_review_release(name)[1]
+            inspect_special = (
+                verified and release and release.episode is None and SPECIAL_TITLE.search(name)
+            )
             aliases = numbered_title_aliases(name, rule, release)
             if (
                 not release
@@ -262,7 +337,13 @@ class FileBatches:
                 or release.season not in (None, rule.season)
                 or release.release_kind
                 not in (ReleaseKind.SINGLE, ReleaseKind.BATCH, ReleaseKind.COLLECTION)
-                or release.media_type not in (MediaType.UNKNOWN, MediaType.EPISODE)
+                or (
+                    not inspect_special
+                    and (
+                        rule.episode_type != "episode"
+                        or release.media_type not in (MediaType.UNKNOWN, MediaType.EPISODE)
+                    )
+                )
             ):
                 continue
             names = {
@@ -292,7 +373,12 @@ class FileBatches:
                 await self.store.save_file_list(digest, paths)
                 cache[digest] = paths
                 self.retry_at.pop(digest, None)
+            if inspect_special:
+                content = special_contents(cache[digest], release, rule)
+                if content:
+                    proofs[key] = content
+                continue
             span = episode_range(cache[digest], name, rule, numbered_aliases=aliases)
             if span:
-                proofs[key] = span
+                proofs[key] = FileContents(span)
         return proofs

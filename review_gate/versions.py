@@ -18,6 +18,8 @@ def version_traits(candidate):
     # Preserve published single-episode IDs so saved selections remain valid.
     if candidate.get("episode_end") is not None:
         identity = {"kind": "batch", "terms": identity}
+    if special := candidate.get("file_special"):
+        identity = {"content": identity, "special": special}
     key = hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:20]
     return key, terms, codec
 
@@ -39,6 +41,7 @@ def variants(candidates):
                 "source": candidate.get("source"),
                 "subtitle": candidate.get("subtitle"),
                 "codec": codec,
+                "special": candidate.get("file_special"),
                 "kind": "batch" if batch else "feature" if candidate.get("feature") else "single",
                 "episodes": set(),
                 "ranges": set(),

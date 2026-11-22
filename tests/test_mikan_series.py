@@ -172,3 +172,41 @@ async def test_merge_verified_pending_siblings_preserves_versions_and_scope(
         assert (await db.bangumi.search_id(second.id)).deleted
         assert {t.bangumi_id for t in await db.torrent.search_all()} == {rule.id}
     plugin.test_send.assert_not_called()
+
+
+async def test_duplicate_cards_and_review_only_candidates_get_backfilled_first(
+    plugin, rule, monkeypatch
+):
+    from module.models import Bangumi
+
+    series = plugin.bridge.mikan
+    # Short unrelated rules used to consume the entire six-page budget.
+    rules = {
+        n: Bangumi(
+            **(
+                rule.model_dump()
+                | {"id": n, "official_title": f"Show {n}" if n < 9 else "Duplicate"}
+            )
+        )
+        for n in range(1, 11)
+    }
+    rows = []
+    for n in rules:
+        row = torrent(n, "fixture")
+        row.bangumi_id = n
+        rows.append(row)
+    extra = torrent(20, "review only")
+    seen = []
+
+    async def fetch(page):
+        seen.append(page)
+        return 100
+
+    from review_gate import mikan_series
+
+    monkeypatch.setattr(mikan_series, "fetch_series", fetch)
+    await series.observe(
+        rules, rows, True, [{"rule_id": 9, "url": extra.url, "homepage": extra.homepage}]
+    )
+    assert set(seen[:3]) == {rows[8].homepage, rows[9].homepage, extra.homepage}
+    assert len(seen) == 6 and extra.url not in series.owners

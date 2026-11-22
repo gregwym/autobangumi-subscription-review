@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urlsplit
 from .batch import parse_review_release
 
 MIKAN_HOSTS = {"mikanani.me", "mikanime.tv"}
+SPECIAL_TITLE = re.compile(r"(?<![a-zA-Z0-9])(?:OVA|OAD)(?![a-zA-Z0-9])", re.I)
 REVISION = re.compile(r"(?<!\w)v([1-9]\d*)(?!\w)", re.I)
 
 
@@ -90,6 +91,10 @@ def confirmed_features(rules, torrents, sources):
         if len(primary) < 4 or primary not in titles:
             continue
         raw = unicodedata.normalize("NFKC", torrent["name"])
+        if SPECIAL_TITLE.search(raw):
+            # A revision pair can describe two TV packs that both include an OAD.
+            # Let the file manifest establish whether this is a standalone special.
+            continue
         revisions = REVISION.findall(raw)
         if revisions and (len(revisions) != 1 or int(revisions[0]) != release.version):
             continue

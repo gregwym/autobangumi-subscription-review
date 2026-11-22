@@ -60,6 +60,11 @@ class Store:
                     infohash TEXT PRIMARY KEY, paths TEXT NOT NULL
                 );
             """)
+            # The first cache format did not read single-file torrents. Invalidate its
+            # empty results once so these releases can be inspected with the current reader.
+            if db.execute("PRAGMA user_version").fetchone()[0] == 0:
+                db.execute("DELETE FROM torrent_file_lists WHERE paths='[]'")
+                db.execute("PRAGMA user_version=1")
 
         await self.call(create)
 

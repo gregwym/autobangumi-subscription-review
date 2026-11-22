@@ -3,7 +3,7 @@
 import asyncio
 import re
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 import httpx2
 from bs4 import BeautifulSoup
@@ -110,19 +110,36 @@ class MikanSeries:
             )
             self.rules[rule.id] = value
 
-    async def observe(self, rules, history, network):
+    async def observe(self, rules, history, network, retained=()):
         rows = defaultdict(list)
         owners = defaultdict(set)
         for t in history:
             if t.bangumi_id in rules or t.bangumi_id is None:
                 owners[t.url].add(t.bangumi_id)
-                rows[t.bangumi_id].append(t)
+                rows[t.bangumi_id].append(release_page(t.url, t.homepage))
         self.owners = {url: next(iter(ids)) for url, ids in owners.items() if len(ids) == 1}
+        # A merge checks all releases, including review-only candidates. Their
+        # URLs contribute evidence but cannot replace the host's canonical owner.
+        for candidate in retained:
+            if candidate["rule_id"] in rules:
+                rows[candidate["rule_id"]].append(
+                    release_page(candidate["url"], candidate.get("homepage"))
+                )
+        card_counts = Counter(
+            (r.official_title, r.season) for r in rules.values() if not r.archived
+        )
+        for rid in rows:
+            rows[rid] = list(dict.fromkeys(rows[rid]))
+
+        def priority(rid):
+            r = rules.get(rid)
+            waiting = r and not r.archived and card_counts[r.official_title, r.season] > 1
+            return (not waiting, len(rows[rid]))
+
         budget = 6 if network else 0
-        # Resolve small rules first so one long-running series cannot starve new rules.
-        for rid, releases in sorted(rows.items(), key=lambda item: len(item[1])):
-            for t in releases:
-                page = release_page(t.url, t.homepage)
+        for rid in sorted(rows, key=priority):
+            pages = rows[rid]
+            for page in pages:
                 key = episode_hash(page)
                 if (
                     budget
@@ -134,7 +151,7 @@ class MikanSeries:
                     await self.resolve(page)
             if rid is None:
                 continue
-            ids = {self.pages.get(episode_hash(release_page(t.url, t.homepage))) for t in releases}
+            ids = {self.pages.get(episode_hash(page)) for page in pages}
             known = ids - {None}
             if len(known) > 1:
                 await self.bind(rules[rid], 0)  # Ambiguous legacy association.
