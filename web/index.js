@@ -16,7 +16,7 @@ button{cursor:pointer}button:disabled{opacity:.45;cursor:default}.primary{backgr
 .muted,small{color:var(--ab-color-text-secondary,#777)}p{margin:8px 0 16px}.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .choices{display:grid;gap:8px;margin:16px 0}.choice{display:flex;align-items:start;gap:10px;padding:12px;border:1px solid #8884;border-radius:8px;cursor:pointer}.choice:has(input:checked){border-color:var(--ab-color-primary,#4f6bed);background:#6478ee0b}.choice input{margin-top:5px;accent-color:var(--ab-color-primary,#4f6bed)}.choice strong{display:block}.tags{display:flex;gap:6px;flex-wrap:wrap;margin-top:5px}.tag{padding:1px 7px;border-radius:4px;background:#8881;font-size:12px}
 label.field{display:grid;gap:6px;margin:12px 0}textarea{width:100%;min-height:72px}details{margin:16px 0}summary{cursor:pointer;color:var(--ab-color-text-secondary,#777)}.actions{margin-top:20px}.notice{padding:10px;background:#d99b1515;border-radius:6px}.error{color:#c14c38}#message{min-height:22px;margin-top:12px}.match{padding:8px 0;border-bottom:1px solid #8883;overflow-wrap:anywhere}#matches{max-height:260px;overflow:auto} [hidden]{display:none!important}
-.start-mode{border:0;padding:0;margin:12px 0;min-width:0}.start-mode legend{padding:0;margin-bottom:6px}
+.version-option{min-width:0;border:1px solid #8884;border-radius:8px}.version-option:has(input:checked){border-color:var(--ab-color-primary,#4f6bed);background:#6478ee0b}.version-option>.choice,.version-option>.choice:has(input:checked){border:0;background:transparent;padding-bottom:4px}.swarm{margin:0 12px 10px 38px;font-size:12px;color:var(--ab-color-text-secondary,#777)}.swarm details{margin:0}.swarm details div{padding:6px 0;border-top:1px solid #8883;overflow-wrap:anywhere}.swarm-name{display:block;font-size:12px}.start-mode{border:0;padding:0;margin:12px 0;min-width:0}.start-mode legend{padding:0;margin-bottom:6px}
 .start-options{display:flex;gap:8px;flex-wrap:wrap}.start-options .choice{align-items:center;min-height:44px;padding:8px 12px}.start-options input{margin:0}
 `;
 const settingsCard = `
@@ -46,6 +46,41 @@ class Status extends HTMLElement {
     changed.addEventListener('change', this.update); this.update();
   }
   disconnectedCallback() {changed.removeEventListener('change', this.update);}
+}
+function swarmTime(seconds) {
+  return new Date(seconds * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+}
+function renderSwarm(container, observation, kind) {
+  const releases = observation?.releases || [];
+  if (!releases.length) {container.textContent = '做种人数未知'; return;}
+  const describe = ({seeds, leechers, checked, source}) =>
+    `${source} · ${seeds} 人做种${leechers == null ? '' : ' · ' + leechers + ' 人下载'} · ${swarmTime(checked)} 查询`;
+  if (releases.length === 1) {
+    const reports = releases[0].reports;
+    if (!reports.length) {container.textContent = '做种人数未知'; return;}
+    container.replaceChildren(...reports.map(report => {
+      const line = document.createElement('div');
+      line.textContent = describe(report);
+      return line;
+    }));
+    return;
+  }
+  const {min, max, zero, unknown} = observation.summary;
+  const unit = kind === 'single' ? '集' : '颗';
+  const range = min == null ? '做种人数未知' : `每${unit} ${min === max ? min : min + '–' + max} 人做种`;
+  const details = document.createElement('details'), summary = document.createElement('summary');
+  summary.textContent = [range, zero ? `${zero} ${unit}为 0` : '', unknown ? `${unknown} ${unit}未知` : '', '查看明细'].filter(Boolean).join(' · ');
+  summary.title = kind === 'single' ? '每集取各修订、各来源报告的最高做种数，再比较各集。' : '每颗种子取各来源报告的最高做种数。';
+  details.append(summary);
+  for (const r of [...releases].sort((a,b) => (a.episode ?? 0) - (b.episode ?? 0) || (a.revision ?? 1) - (b.revision ?? 1))) {
+    const line = document.createElement('div'), title = document.createElement('span');
+    title.textContent = r.name; title.className = 'swarm-name'; title.title = r.name;
+    const label = r.episode == null ? '单片' : `第 ${r.episode}${r.end == null ? '' : '–' + r.end} 集`;
+    line.append(title, document.createTextNode(`${label}${r.revision > 1 ? ' v' + r.revision : ''}${r.reports.length ? '' : ' · 做种人数未知'}`));
+    for (const report of r.reports) {const obs = document.createElement('span'); obs.className = 'swarm-name'; obs.textContent = describe(report); line.append(obs);}
+    details.append(line);
+  }
+  container.replaceChildren(details);
 }
 class Detail extends HTMLElement {
   connectedCallback() {
@@ -127,6 +162,7 @@ class Detail extends HTMLElement {
       if (p.unfiltered) {anyRadio.checked = true; this.unfiltered = true;}
       anyRadio.onchange = () => {this.unfiltered = anyRadio.checked; this.selected.clear(); this.$('choices').querySelectorAll('input[name=version]').forEach(i => {i.checked = false;}); this.$('include').value = ''; this.$('exclude').value = ''; this.$('custom').checked = false; this.$('include-field').hidden = true; this.schedule();};
       any.append(anyRadio, anyText); this.$('choices').append(any);
+      const swarmRows = new Map();
       for (const v of data.versions) {
         const label = document.createElement('label'); label.className = 'choice';
         const radio = document.createElement('input'); radio.type = 'checkbox'; radio.name = 'version'; radio.value = v.id;
@@ -142,8 +178,12 @@ class Detail extends HTMLElement {
         const same = p.version_ids?.length ? p.version_ids.includes(v.id) : p.version_id ? p.version_id === v.id : v.kind === 'single' && p.include?.length === v.include.length && p.include.every(t => v.include.some(x => x.toLowerCase() === t.toLowerCase()));
         if (same) {radio.checked = true; this.selected.add(v.id);}
         radio.onchange = () => {if (radio.checked) this.selected.add(v.id); else this.selected.delete(v.id); this.unfiltered = false; anyRadio.checked = false; this.$('include').value = v.include.join('\n'); this.$('custom').checked = false; this.$('include-field').hidden = true; this.schedule();};
-        label.append(radio, body); this.$('choices').append(label);
+        const option = document.createElement('div'); option.className = 'version-option';
+        const swarm = document.createElement('div'); swarm.className = 'swarm'; swarm.textContent = '正在查询做种人数…';
+        swarmRows.set(v.id, {container:swarm, kind:v.kind});
+        label.append(radio, body); option.append(label, swarm); this.$('choices').append(option);
       }
+      if (swarmRows.size) this.loadSwarm(data, swarmRows);
       this.$('custom').checked = Boolean(p.include?.length && !this.selected.size);
       this.$('include-field').hidden = !this.$('custom').checked;
       this.$('message').className = '';
@@ -153,6 +193,12 @@ class Detail extends HTMLElement {
       if (this.selected.size || this.unfiltered || this.$('custom').checked) this.schedule();
     } catch (e) {if (serial === this.serial) this.error(e);}
     finally {if (this.isConnected) this.$('refresh').disabled = false;}
+  }
+  async loadSwarm(data, rows) {
+    let observations = {};
+    try {observations = await this.host.api.get(`rules/${this.rid}/swarm`);} catch {}
+    if (!this.isConnected || this.data !== data) return;
+    for (const [id, row] of rows) renderSwarm(row.container, observations[id], row.kind);
   }
   schedule() {
     if (!this.data || this.data.needs_sync) return;

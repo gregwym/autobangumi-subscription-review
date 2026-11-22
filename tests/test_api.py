@@ -7,13 +7,6 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 
-@pytest.fixture
-def api(plugin):
-    app = FastAPI()
-    app.include_router(plugin.api(), prefix="/review")
-    return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
-
-
 @pytest.mark.parametrize(
     ("options", "mode", "expected"),
     [

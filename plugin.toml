@@ -1,7 +1,7 @@
 [plugin]
 id = "subscription-review"
 name = "订阅审核"
-version = "0.6.5"
+version = "0.7.0"
 sdk = ">=0.6,<1"
 entry = "review_gate.plugin:SubscriptionReview"
 description = "新番先审核版本再下载；包含适配 AB 4.0.0 的受控 qBittorrent 下载器。"

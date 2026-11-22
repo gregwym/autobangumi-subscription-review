@@ -114,3 +114,13 @@ async def approve(plugin, rule, **kwargs):
     entry = next(r for r in await plugin.store.rules() if r["id"] == rule.id)
     policy = Policy(include=["HEVC", "1080p", "内封"], mode="backlog", **kwargs)
     await plugin.store.set_policy(rule.id, policy, entry["revision"])
+
+
+@pytest.fixture
+def api(plugin):
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+
+    app = FastAPI()
+    app.include_router(plugin.api(), prefix="/review")
+    return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")

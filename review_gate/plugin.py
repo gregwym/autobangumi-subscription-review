@@ -16,6 +16,7 @@ from .audit import Audit
 from .bridge40 import PROVIDER, Bridge40
 from .policy import DEFAULT_MODE, Policy, fingerprint
 from .store import Store
+from .swarm import SwarmHealth
 from .updater import Updater
 from .versions import variants
 
@@ -64,6 +65,7 @@ def snapshot(revision, candidates, downloaded, exclusion):
 class SubscriptionReview(Plugin):
     async def setup(self):
         self.audit = Audit(self.ctx.log)
+        self.swarm = SwarmHealth()
         self.previews = {}
         self.history_previews = {}
         self.maintenance_lock = asyncio.Lock()
@@ -184,6 +186,13 @@ class SubscriptionReview(Plugin):
                 if rule["state"] == "pending"
                 else [],
             }
+
+        @router.get("/rules/{rid}/swarm")
+        async def swarm(rid: int):
+            current, _, stored = await read_review_rule(rid)
+            if stored is None or fingerprint(current) != fingerprint(stored):
+                return {}
+            return await self.swarm.for_rule(current, await self.store.candidates(rid))
 
         @router.post("/rules/{rid}/merge/{other}")
         async def merge_mikan(rid: int, other: int):
