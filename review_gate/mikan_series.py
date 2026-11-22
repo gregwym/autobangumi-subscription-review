@@ -31,14 +31,34 @@ def release_page(url, homepage):
     return None
 
 
-def page_series(data):
+def page_series(data, expected_hash=None):
     soup = BeautifulSoup(data, "html.parser")
-    ids = {
-        int(match[1])
-        for link in soup.select("p.bangumi-title a[href]")
-        if (match := SERIES_PATH.fullmatch(link["href"]))
+    links = soup.select("p.bangumi-title a[href]")
+    if links:
+        matches = [SERIES_PATH.fullmatch(link["href"]) for link in links]
+        if all(matches) and len(ids := {int(match[1]) for match in matches}) == 1:
+            return ids.pop()
+        return None
+    # Only an authenticated release identity (matching torrent hash in the
+    # public page) can distinguish an unclassified post from a broken page.
+    title = soup.select_one("#sk-container .episode-header .episode-title")
+    if (
+        not expected_hash
+        or not title
+        or not title.get_text(strip=True)
+        or not soup.select_one("#sk-container .bangumi-info")
+        or soup.select_one('p.bangumi-title, #sk-container a[href*="/Home/Bangumi/"]')
+    ):
+        return None
+    paths = [
+        a["href"]
+        for a in soup.select('#sk-container .leftbar-nav a.episode-btn[href^="/Download/"]')
+    ]
+    hashes = {
+        m[1].lower() if (m := TORRENT.fullmatch("https://mikanani.me" + path)) else None
+        for path in paths
     }
-    return ids.pop() if len(ids) == 1 else None
+    return 0 if hashes == {expected_hash} else None
 
 
 async def fetch_series(homepage):
@@ -52,7 +72,7 @@ async def fetch_series(homepage):
             if len(body) + len(chunk) > PAGE_LIMIT:
                 return None
             body.extend(chunk)
-    return await asyncio.to_thread(page_series, bytes(body))
+    return await asyncio.to_thread(page_series, bytes(body), episode_hash(homepage))
 
 
 class MikanSeries:
@@ -62,6 +82,10 @@ class MikanSeries:
         self.rules = {}
         self.owners = {}
         self.retry_at = {}
+        self.unlisted_until = {}
+        self.catalog = {}
+        self.anchors = {}
+        self.pending_pages = set()
         self.discovery_lock = asyncio.Lock()
 
     async def load(self):
@@ -78,6 +102,8 @@ class MikanSeries:
         key = episode_hash(homepage)
         if not key or key in self.pages or self.retry_at.get(key, 0) > time.monotonic():
             return self.pages.get(key)
+        if self.unlisted_until.get(key, 0) > time.monotonic():
+            return 0
         try:
             series = await fetch_series(homepage)
         except httpx2.HTTPError, TimeoutError, ValueError:
@@ -85,6 +111,10 @@ class MikanSeries:
         if series is None:
             self.retry_at[key] = time.monotonic() + 600
             return None
+        if series == 0:
+            self.unlisted_until[key] = time.monotonic() + 6 * 3600
+            return 0
+        self.unlisted_until.pop(key, None)
         await self.store.call(
             lambda db: db.execute(
                 "INSERT OR REPLACE INTO mikan_episodes VALUES(?,?)", (key, series)
@@ -125,6 +155,7 @@ class MikanSeries:
                 rows[candidate["rule_id"]].append(
                     release_page(candidate["url"], candidate.get("homepage"))
                 )
+        rows[None].extend(self.pending_pages)
         card_counts = Counter(
             (r.official_title, r.season) for r in rules.values() if not r.archived
         )
@@ -145,18 +176,97 @@ class MikanSeries:
                     budget
                     and key
                     and key not in self.pages
+                    and self.unlisted_until.get(key, 0) <= time.monotonic()
                     and self.retry_at.get(key, 0) <= time.monotonic()
                 ):
                     budget -= 1
                     await self.resolve(page)
             if rid is None:
                 continue
-            ids = {self.pages.get(episode_hash(page)) for page in pages}
+            ids = {
+                self.pages.get(key)
+                for page in pages
+                if self.unlisted_until.get(key := episode_hash(page), 0) <= time.monotonic()
+            }
             known = ids - {None}
             if len(known) > 1:
                 await self.bind(rules[rid], 0)  # Ambiguous legacy association.
             elif len(ids) == 1 and known:
                 await self.bind(rules[rid], next(iter(known)))
+
+        self.pending_pages = {
+            p
+            for p in self.pending_pages
+            if episode_hash(p) not in self.pages
+            and self.unlisted_until.get(episode_hash(p), 0) <= time.monotonic()
+        }
+        from module.database.bangumi import _normalize_group_name
+
+        anchors = defaultdict(list)
+        for c in retained:
+            rule = rules.get(c["rule_id"])
+            key = episode_hash(release_page(c["url"], c.get("homepage")))
+            if (
+                rule
+                and c.get("episode_key")
+                and c.get("episode") is not None
+                and self.pages.get(key)
+                and self.pages[key] == self.identity(rule)
+                and self.owners.get(c["url"]) == rule.id
+            ):
+                anchors[rule.id, _normalize_group_name(c.get("group")), self.pages[key]].append(
+                    (c["episode"], c.get("episode_end") or c["episode"])
+                )
+        self.catalog, self.anchors = dict(rules), anchors
+
+    def match_unlisted(self, torrent, rules):
+        from module.database.bangumi import _all_title_patterns, _normalize_group_name
+        from module.parser.analyser.tokenizer.result import MediaType, ReleaseKind
+
+        _, release = parse_review_release(torrent.name)
+        pack = bounded_batch(torrent.name, release)
+        if not release or (not pack and release.release_kind is not ReleaseKind.SINGLE):
+            return None
+        release = pack or release
+        if (
+            release.media_type is not MediaType.EPISODE
+            or release.episode is None
+            or not release.group
+        ):
+            return None
+        # Some parsers include trailing packaging notes in the parsed title.
+        # Also compare whole multilingual titles before the first metadata bracket.
+        label = re.match(r"^\s*[\[【][^\]】]+[\]】]\s*([^\[【]*)", torrent.name)
+        titles = {release.title_en, release.title_zh, release.title_jp}
+        if label:
+            titles.update(label[1].split("/"))
+        titles = {value.strip().casefold() for value in titles if value and value.strip()}
+        group = _normalize_group_name(release.group)
+        supplied = {r.id: r for r in rules}
+        matches = [
+            r
+            for r in (self.catalog | supplied).values()
+            if not r.deleted
+            and r.episode_type == "episode"
+            and (release.season is None or r.season == release.season)
+            and group
+            and _normalize_group_name(r.group_name) == group
+            and any(
+                t and t.strip().casefold() in titles
+                for t in [r.official_title, *_all_title_patterns(r)]
+            )
+        ]
+        if len(matches) != 1:
+            return None
+        rule = matches[0]
+        identity = self.identity(rule)
+        if rule.id not in supplied or rule.archived or not identity:
+            return None
+        if release.season is None:
+            spans = self.anchors.get((rule.id, group, identity), ())
+            if not any(first <= release.episode <= last + 1 for first, last in spans):
+                return None
+        return rule
 
     def members(self, series, rules):
         return [r for r in rules if not r.deleted and self.identity(r) == series]
@@ -202,7 +312,12 @@ class MikanSeries:
         page = release_page(torrent.url, torrent.homepage)
         if not page:
             return match_title(torrent.name, rules)
-        series = self.pages.get(episode_hash(page))
+        key = episode_hash(page)
+        series = self.pages.get(key)
+        if self.unlisted_until.get(key, 0) > time.monotonic():
+            return self.match_unlisted(torrent, rules)
+        if series is None:
+            self.pending_pages.add(page)
         owner = self.owners.get(torrent.url)
         if not series:
             return match_title(torrent.name, [r for r in rules if r.id == owner])

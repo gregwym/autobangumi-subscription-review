@@ -13,6 +13,7 @@ import inspect
 import json
 import logging
 import re
+import time
 from dataclasses import replace
 
 from .audit import Audit, traced
@@ -132,12 +133,9 @@ class Bridge40:
                 raise RuntimeError("审核下载器不允许创建绕过审核的 qB RSS 规则")
 
         def reviewed_match(engine, torrent, rules):
-            selected = bridge.mikan.match(torrent, rules, bridge.match_rule, bridge.file_ranges)
-            if not selected or global_excluded(torrent.name):
-                return None
-            if selected.filter and engine._get_filter_pattern(selected.filter).search(torrent.name):
-                return None
-            torrent.bangumi_id = selected.id
+            selected = bridge.select_rule(engine, torrent, rules)
+            if selected:
+                torrent.bangumi_id = selected.id
             return selected
 
         async def reviewed_discovery(analyser, rss, torrents, engine, bangumi_list):
@@ -246,9 +244,7 @@ class Bridge40:
                 candidates = []
                 exclusion = bridge.exclusion_check(bangumi.filter)
                 for item in items:
-                    if parsed_batch(item.name) is not None and not reviewed_match(
-                        RSSEngine(None), item, [bangumi]
-                    ):
+                    if not await bridge.valid_dispatch_rule(item, bangumi):
                         return AddResult.FAILED
                     cid = await bridge.capture(bangumi, item)
                     candidate = await bridge.store.candidate(cid)
@@ -344,6 +340,35 @@ class Bridge40:
                 if self.analyser_class.link_to_data is getattr(self, "link_wrapper", None):
                     self.analyser_class.link_to_data = self.original_link
         # Already-created GuardedQb instances retain active=False and refuse adds.
+
+    async def valid_dispatch_rule(self, torrent, rule):
+        """Recheck the full current catalog before using title-based Mikan routing."""
+        from module.database import Database
+        from module.rss import RSSEngine
+
+        page = release_page(torrent.url, torrent.homepage)
+        key = episode_hash(page)
+        series = self.mikan.pages.get(key)
+        binding = self.mikan.identity(rule)
+        if series and binding is not None and binding != series:
+            return False
+        if self.mikan.unlisted_until.get(key, 0) > time.monotonic():
+            async with Database() as db:
+                rules = await db.bangumi.search_all()
+            selected = self.select_rule(RSSEngine(None), torrent, rules)
+            return selected is not None and selected.id == rule.id
+        return (
+            parsed_batch(torrent.name) is None
+            or self.select_rule(RSSEngine(None), torrent, [rule]) is not None
+        )
+
+    def select_rule(self, engine, torrent, rules):
+        selected = self.mikan.match(torrent, rules, self.match_rule, self.file_ranges)
+        if not selected or global_excluded(torrent.name):
+            return None
+        if selected.filter and engine._get_filter_pattern(selected.filter).search(torrent.name):
+            return None
+        return selected
 
     @staticmethod
     def match_rule(name, rules, *, batch=None):
@@ -670,15 +695,12 @@ class Bridge40:
 
     async def filter(self, torrent, bangumi):
         from module.database import Database
-        from module.rss.engine import RSSEngine
 
         async with Database() as db:
             rule = await db.bangumi.search_id(bangumi.id)
         if not rule or rule.deleted:
             return False
-        if parsed_batch(torrent.name) is not None and not RSSEngine(None).match_torrent(
-            torrent, [rule]
-        ):
+        if not await self.valid_dispatch_rule(torrent, rule):
             return False
         async with self.lock:
             cid = await self.capture(rule, torrent)

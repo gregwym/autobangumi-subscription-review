@@ -286,3 +286,64 @@ async def test_same_release_on_another_feed_never_creates_a_rule_during_backfill
         assert plugin.bridge.mikan.identity(rule) is None
         assert (await db.torrent.search(old.id)).downloaded
     plugin.test_send.assert_not_called()
+
+
+def test_unclassified_requires_a_complete_episode_page_for_the_expected_hash():
+    key = "1" * 40
+    page = f"""
+        <div id="sk-container"><div class="episode-header"><p class="episode-title">Example</p></div>
+        <p class="bangumi-info">Group</p><div class="leftbar-nav">
+        <a class="episode-btn" href="/Download/20260101/{key}.torrent"></a></div></div>"""
+    assert page_series(page, key) == 0
+    assert page_series(page, "2" * 40) is None
+    assert page_series(page.replace("episode-header", "other"), key) is None
+    assert page_series(page + '<p class="bangumi-title"></p>', key) is None
+    assert page_series(b"<html>Unavailable</html>", key) is None
+
+
+async def test_unlisted_uses_exact_title_group_and_verified_episode_numbering(
+    plugin, rule, monkeypatch
+):
+    from review_gate import mikan_series
+
+    br = plugin.bridge
+    gate = br.mikan
+    rule.season = 2
+    old = torrent(71, "[Group] Example Show - 18 [1080p]")
+    old.bangumi_id = rule.id
+    pack = torrent(72, "[Group] 示例番剧 / Example Show [18-22 修正合集][1080p HEVC][Fin]")
+    from review_gate.mikan_series import episode_hash
+
+    answers = {old.homepage: 17, pack.homepage: None}
+    monkeypatch.setattr(mikan_series, "fetch_series", AsyncMock(side_effect=answers.__getitem__))
+    await gate.resolve(old.homepage)
+    await br.capture(rule, old)
+    await gate.observe({rule.id: rule}, [old], False, await plugin.store.candidates())
+
+    def match(item, rules):
+        return gate.match(item, rules, br.match_rule, {})
+
+    await gate.resolve(pack.homepage)
+    assert match(pack, [rule]) is None
+    key = episode_hash(pack.homepage)
+    answers[pack.homepage] = 0
+    gate.retry_at.clear()
+    await gate.resolve(pack.homepage)
+    assert key not in gate.pages and match(pack, [rule]).id == rule.id
+    for bad in [
+        pack.name.replace("18-22", "01-13"),
+        pack.name.replace("Group", "Other"),
+        pack.name.replace("示例番剧 / Example Show", "Example Show Extra"),
+    ]:
+        assert match(pack.model_copy(update={"name": bad}), [rule]) is None
+    other = rule.model_copy(update={"id": rule.id + 1, "season": 1})
+    await gate.observe(
+        {rule.id: rule, other.id: other}, [old], False, await plugin.store.candidates()
+    )
+    assert match(pack, [rule]) is None
+    # A subsequently classified release always follows its real series ID.
+    answers[pack.homepage] = 23
+    gate.unlisted_until[key] = 0
+    await gate.resolve(pack.homepage)
+    assert gate.pages[key] == 23 and match(pack, [rule]) is None
+    plugin.test_send.assert_not_called()

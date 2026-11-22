@@ -440,3 +440,20 @@ def test_bracketed_collection_suffix_with_a_number_in_the_title(label):
     assert release.raw == name
     assert parsed_batch(name.replace("01-24", "24-01")) is None
     assert parsed_batch(name + "[NCOP]") is None
+
+
+async def test_filter_accepts_readonly_batch_view_only_after_version_approval(plugin, rule):
+    from module.conf import settings
+    from module.models import Torrent
+    from module.plugin.views import bangumi_info, torrent_info
+
+    settings.rss_parser.filter = ["720"]
+    item = Torrent(name="[Group] Example Show [14-22][WebRip 1080p HEVC]", url="magnet:?batch-view")
+    resource, owner = torrent_info(item), bangumi_info(rule)
+    assert not (await plugin.review(resource, None, owner)).accept
+    [version] = variants(await plugin.store.candidates(rule.id))
+    assert version["ranges"] == [(14, 22)]
+    [stored] = await plugin.store.rules(rule.id)
+    await plugin.store.set_policy(rule.id, Policy(version_ids=[version["id"]]), stored["revision"])
+    assert (await plugin.review(resource, None, owner)).accept
+    plugin.test_send.assert_not_called()
