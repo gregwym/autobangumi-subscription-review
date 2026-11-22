@@ -10,6 +10,7 @@ from pathlib import PurePosixPath
 import httpx2
 
 from .batch import EXTRAS, SEASON, parse_review_release
+from .bencode import decode_dict
 from .feature import SPECIAL_TITLE, dedicated_feed, normalized_title
 from .mikan_series import TORRENT, episode_hash, release_page
 
@@ -62,43 +63,8 @@ def decode_paths(data, digest):
 
     if not data or len(data) > LIMIT:
         raise ValueError("invalid torrent size")
-    pos = nodes = 0
-
-    def read(depth=0):
-        nonlocal pos, nodes
-        nodes += 1
-        if depth > 24 or nodes > 100_000 or pos >= len(data):
-            raise ValueError("invalid bencode")
-        tag = data[pos : pos + 1]
-        if tag.isdigit():
-            end = data.index(b":", pos, pos + 10)
-            size = data[pos:end]
-            if not size.isdigit() or end + 1 + int(size) > len(data):
-                raise ValueError("invalid string")
-            pos = end + 1 + int(size)
-            return data[end + 1 : pos]
-        pos += 1
-        if tag == b"i":
-            end = data.index(b"e", pos, pos + 24)
-            num = int(data[pos:end])
-            pos = end + 1
-            return num
-        if tag not in (b"d", b"l"):
-            raise ValueError("invalid type")
-        result = {} if tag == b"d" else []
-        while data[pos : pos + 1] != b"e":
-            key = read(depth + 1)
-            if tag == b"d":
-                if not isinstance(key, bytes) or key in result:
-                    raise ValueError("invalid key")
-                result[key] = read(depth + 1)
-            else:
-                result.append(key)
-        pos += 1
-        return result
-
-    root = read()
-    if pos != len(data) or not isinstance(root, dict) or _torrent_infohash(data) != digest:
+    root = decode_dict(data)
+    if _torrent_infohash(data) != digest:
         raise ValueError("unexpected info hash")
     info = root.get(b"info")
     if not isinstance(info, dict):

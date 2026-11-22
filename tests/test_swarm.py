@@ -2,11 +2,13 @@ import asyncio
 import base64
 import struct
 from unittest.mock import AsyncMock
+from urllib.parse import unquote_to_bytes
 
+import httpx2
 import pytest
 
 from review_gate import swarm
-from review_gate.opentrackr import parse_response
+from review_gate.opentrackr import parse_response, scrape_http
 from review_gate.swarm import SwarmHealth, index_page, magnet_hash, summarize
 
 
@@ -44,6 +46,30 @@ def test_tracker_requires_matching_response_and_complete_counts():
     ]:
         with pytest.raises(ValueError):
             parse_response(invalid, 2, 44, 12)
+
+
+async def test_http_tracker_binary_hashes_and_missing_rows(monkeypatch):
+    from module.network import request_url
+
+    raw = bytes.fromhex("ff2b2f260020" * 3 + "0026")
+    absent = bytes.fromhex("dc" * 20)
+    extra = bytes.fromhex("ba" * 20)
+    counts = b"d8:completei0e10:incompletei3ee"
+
+    def reply(request):
+        assert request.url.host == "tracker.opentrackr.org"
+        assert request.url.path == "/scrape"
+        assert [
+            unquote_to_bytes(q.removeprefix(b"info_hash=")) for q in request.url.query.split(b"&")
+        ] == [raw, absent]
+        body = b"d5:filesd20:" + raw + counts + b"20:" + extra + counts + b"ee"
+        return httpx2.Response(200, content=body)
+
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(reply)) as client:
+        monkeypatch.setattr(request_url, "get_shared_client", AsyncMock(return_value=client))
+        assert await scrape_http([raw.hex(), absent.hex()]) == {
+            raw.hex(): {"seeds": 0, "leechers": 3}
+        }
 
 
 def test_range_groups_revisions_and_distinguishes_zero_and_unknown():
@@ -91,7 +117,7 @@ async def test_version_health_is_read_only_exact_and_cached(plugin, rule, api, m
         }
     )
     monkeypatch.setattr(swarm, "fetch_index", lookup)
-    monkeypatch.setattr(swarm, "scrape", tracker)
+    monkeypatch.setattr(swarm, "scrape_http", tracker)
     monkeypatch.setattr(swarm, "getproxies_environment", lambda: {})
     async with api:
         path = f"/review/rules/{rule.id}"
@@ -130,21 +156,27 @@ async def test_source_outage_and_proxy_do_not_generate_zero_reports(monkeypatch)
     from module.conf import settings
 
     key = "ab" * 20
-    service = SwarmHealth()
     lookup = AsyncMock(side_effect=TimeoutError)
     tracker = AsyncMock(side_effect=TimeoutError)
+    http = AsyncMock(side_effect=TimeoutError)
     monkeypatch.setattr(swarm, "fetch_index", lookup)
+    monkeypatch.setattr(swarm, "scrape_http", http)
     monkeypatch.setattr(swarm, "scrape", tracker)
     monkeypatch.setattr(swarm, "getproxies_environment", lambda: {"https": "proxy"})
-    assert await service.tracker_stats({key}) == {}
+    assert await SwarmHealth().tracker_stats({key}) == {}
     tracker.assert_not_called()
     monkeypatch.setattr(swarm, "getproxies_environment", lambda: {})
     monkeypatch.setattr(settings.proxy, "enable", True)
-    assert await service.tracker_stats({key}) == {}
+    assert await SwarmHealth().tracker_stats({key}) == {}
     tracker.assert_not_called()
     monkeypatch.setattr(settings.proxy, "enable", False)
+    service = SwarmHealth()
     for _ in range(2):
         assert await service.tracker_stats({key}) == {}
         assert await service.index_stats({"Example": {key}}) == {}
     tracker.assert_awaited_once()
     lookup.assert_awaited_once()
+    assert http.await_count == 3
+    tracker.side_effect = None
+    tracker.return_value = {key: {"seeds": 7, "leechers": 3}}
+    assert (await SwarmHealth().tracker_stats({key}))[key]["seeds"] == 7

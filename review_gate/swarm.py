@@ -13,7 +13,7 @@ from bs4 import BeautifulSoup
 
 from .batch import parse_review_release
 from .mikan_series import TORRENT, episode_hash
-from .opentrackr import BATCH, scrape
+from .opentrackr import BATCH, scrape, scrape_http
 from .versions import version_traits
 
 INDEX = "https://share.dmhy.org/topics/list"
@@ -168,8 +168,9 @@ class SwarmHealth:
     async def tracker_stats(self, hashes):
         from module.conf import settings
 
-        if settings.proxy.enable or {"all", "http", "https"} & getproxies_environment().keys():
-            return {}
+        use_proxy = settings.proxy.enable or bool(
+            {"all", "http", "https"} & getproxies_environment().keys()
+        )
         async with self.tracker_lock:
             now = time.time()
             cached = {
@@ -180,14 +181,20 @@ class SwarmHealth:
             missing = sorted(hashes - cached.keys())
             if now >= self.tracker_retry:
                 try:
-                    async with asyncio.timeout(8):
+                    async with asyncio.timeout(12):
                         for offset in range(0, len(missing), BATCH):
-                            results = await scrape(missing[offset : offset + BATCH])
+                            batch = missing[offset : offset + BATCH]
+                            try:
+                                results = await scrape_http(batch)
+                            except httpx2.HTTPError, OSError, TimeoutError, ValueError:
+                                if use_proxy:
+                                    raise
+                                results = await scrape(batch)
                             checked = int(time.time())
                             for h, row in results.items():
                                 cached[h] = {**row, "source": "OpenTrackr", "checked": checked}
                                 self.tracker_cache[h] = cached[h]
-                except OSError, TimeoutError, ValueError:
+                except httpx2.HTTPError, OSError, TimeoutError, ValueError:
                     self.tracker_retry = time.time() + 60
             while len(self.tracker_cache) > 4096:
                 self.tracker_cache.pop(next(iter(self.tracker_cache)))
