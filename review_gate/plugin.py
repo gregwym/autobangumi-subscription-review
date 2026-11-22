@@ -178,7 +178,26 @@ class SubscriptionReview(Plugin):
                 "versions": await asyncio.to_thread(variants, items),
                 "health": await self.bridge.health(),
                 "needs_sync": needs_sync,
+                "merge_options": await asyncio.to_thread(
+                    self.bridge.maintenance().merge_options, rid
+                )
+                if rule["state"] == "pending"
+                else [],
             }
+
+        @router.post("/rules/{rid}/merge/{other}")
+        async def merge_mikan(rid: int, other: int):
+            try:
+                async with self.bridge.mikan.discovery_lock, self.bridge.replay_lock:
+                    async with self.bridge.lock:
+                        result = await asyncio.to_thread(
+                            self.bridge.maintenance().merge_mikan, rid, other
+                        )
+                    await self.bridge.sync_history()
+                    self.audit.emit("maintenance.mikan.merged", **result)
+                    return result
+            except ValueError as e:
+                raise HTTPException(409, str(e)) from e
 
         @router.get("/rules/{rid}/candidates")
         async def candidates(rid: int):

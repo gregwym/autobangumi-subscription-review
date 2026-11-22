@@ -25,7 +25,7 @@ def selection(key):
     identity = json.loads(key)
     if identity[1] == "feature":
         return "feature"
-    if len(identity) == 6 and identity[5] is not None:
+    if len(identity) >= 6 and identity[5] is not None:
         return f"batch:{identity[3]}:{identity[5]}"
     return identity[3]
 
@@ -55,6 +55,7 @@ class Maintenance:
                 "review.candidates",
                 "review.delivered",
                 "review.reservations",
+                "review.mikan_bindings",
             )
         }
 
@@ -70,12 +71,16 @@ class Maintenance:
             target["season"] + (target.get("season_offset") or 0),
         ]
 
+        series_by_rule = {r["rule_id"]: r["series"] for r in data["review.mikan_bindings"]}
+        series = series_by_rule.get(rid)
+
         def relevant(key):
             try:
                 value = json.loads(key)
                 return (
                     isinstance(value, list)
-                    and len(value) in (4, 6)
+                    and len(value) in (4, 6, 7)
+                    and (len(value) < 7 or value[6] == series)
                     and (value[:3] == prefix or value[:3] == [prefix[0], "feature", prefix[2]])
                 )
             except TypeError, ValueError:
@@ -115,7 +120,7 @@ class Maintenance:
                 rule["official_title"].casefold().strip(),
                 rule.get("episode_type", "episode"),
                 rule["season"] + (rule.get("season_offset") or 0),
-            ] == prefix:
+            ] == prefix and series_by_rule.get(key) == series:
                 related.add(key)
         return target, candidates, torrents, keys, related
 
@@ -285,3 +290,128 @@ class Maintenance:
             except BaseException:
                 db.rollback()
                 raise
+
+    @staticmethod
+    def _merge_series(db, rule):
+        """All releases and review-only candidates must independently attest one series."""
+        from .mikan_series import episode_hash, release_page
+
+        pages = [
+            release_page(r[0], r[1])
+            for r in db.execute(
+                "SELECT url,homepage FROM torrent WHERE bangumi_id=? UNION "
+                "SELECT url,json_extract(payload,'$.homepage') FROM review.candidates WHERE rule_id=?",
+                (rule["id"], rule["id"]),
+            )
+        ]
+        if not pages:
+            return None
+        ids = set()
+        for page in pages:
+            row = db.execute(
+                "SELECT series FROM review.mikan_episodes WHERE episode=?", (episode_hash(page),)
+            ).fetchone()
+            if not row:
+                return None
+            ids.add(row[0])
+        return next(iter(ids)) if len(ids) == 1 else None
+
+    @staticmethod
+    def _unused(db, rid):
+        row = db.execute("SELECT state,policy FROM review.rules WHERE id=?", (rid,)).fetchone()
+        if not row or row["state"] != "pending" or row["policy"] is not None:
+            return False
+        return not any(
+            db.execute(q, (rid,)).fetchone()
+            for q in (
+                "SELECT 1 FROM torrent WHERE bangumi_id=? AND (downloaded OR qb_hash IS NOT NULL)",
+                "SELECT 1 FROM aria2_gid WHERE bangumi_id=?",
+                "SELECT 1 FROM rename_operation WHERE bangumi_id=?",
+                "SELECT 1 FROM review.candidates c WHERE rule_id=? AND (status!='held' OR "
+                "EXISTS (SELECT 1 FROM review.reservations r WHERE r.url=c.url) OR "
+                "EXISTS (SELECT 1 FROM review.delivered d WHERE d.url=c.url))",
+            )
+        )
+
+    def _siblings(self, db, rid):
+        rule = db.execute(
+            "SELECT * FROM bangumi WHERE id=? AND NOT deleted AND NOT archived", (rid,)
+        ).fetchone()
+        if not rule or not self._unused(db, rid):
+            return []
+        series = self._merge_series(db, rule)
+        if not series:
+            return []
+        # Retain settings and any user overrides. Only parser labels and sources may differ.
+        descriptive = {
+            "id",
+            "title_raw",
+            "title_aliases",
+            "dpi",
+            "source",
+            "subtitle",
+            "group_name",
+            "rss_link",
+            "poster_link",
+        }
+        options = []
+        for other in db.execute(
+            "SELECT b.* FROM bangumi b JOIN review.mikan_bindings m ON b.id=m.rule_id WHERE m.series=? AND b.id!=? AND NOT b.deleted AND NOT b.archived",
+            (series, rid),
+        ):
+            if (
+                all(rule[k] == other[k] for k in rule.keys() if k not in descriptive)
+                and self._unused(db, other["id"])
+                and self._merge_series(db, other) == series
+            ):
+                options.append(other["id"])
+        return options
+
+    def merge_options(self, rid):
+        with self.connect() as db:
+            return self._siblings(db, rid)
+
+    def merge_mikan(self, rid, other):
+        from .policy import candidate_id, fingerprint
+
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if other not in self._siblings(db, rid):
+                raise ValueError("规则、选择或历史不符合合并条件，请刷新")
+            rule, old = (
+                dict(db.execute("SELECT * FROM bangumi WHERE id=?", (i,)).fetchone())
+                for i in (rid, other)
+            )
+            backup = self.backup()
+            aliases = [
+                *json.loads(rule["title_aliases"] or "[]"),
+                old["title_raw"],
+                *json.loads(old["title_aliases"] or "[]"),
+            ]
+            aliases = list(dict.fromkeys(a for a in aliases if a and a != rule["title_raw"]))
+            links = ",".join(
+                dict.fromkeys(filter(None, (rule["rss_link"] + "," + old["rss_link"]).split(",")))
+            )
+            db.execute(
+                "UPDATE bangumi SET title_aliases=?,rss_link=? WHERE id=?",
+                (json.dumps(aliases, ensure_ascii=False), links, rid),
+            )
+            db.execute("UPDATE torrent SET bangumi_id=? WHERE bangumi_id=?", (rid, other))
+            for row in list(
+                db.execute("SELECT * FROM review.candidates WHERE rule_id=?", (other,))
+            ):
+                cid = candidate_id(rid, row["url"])
+                data = json.loads(row["payload"])
+                data.update(self.parse(SimpleNamespace(**rule), data["name"], row["url"]))
+                data.update(id=cid, rule_id=rid, rule_fingerprint=fingerprint(rule))
+                db.execute(
+                    "INSERT INTO review.candidates(id,rule_id,url,payload,first_seen,status) VALUES(?,?,?,?,?,'held') "
+                    "ON CONFLICT(id) DO UPDATE SET first_seen=MIN(first_seen,excluded.first_seen)",
+                    (cid, rid, row["url"], json.dumps(data, ensure_ascii=False), row["first_seen"]),
+                )
+            db.execute("DELETE FROM review.candidates WHERE rule_id=?", (other,))
+            db.execute("DELETE FROM review.rules WHERE id=?", (other,))
+            db.execute("UPDATE review.rules SET revision=revision+1 WHERE id=?", (rid,))
+            db.execute("UPDATE bangumi SET deleted=1 WHERE id=?", (other,))
+            db.commit()
+            return {"kept": rid, "merged": other, "backup": str(backup)}

@@ -67,6 +67,7 @@ class Detail extends HTMLElement {
         <label class="field">排除（每行一项，任一匹配即跳过）<textarea id="exclude"></textarea></label>
         <details><summary>查看匹配明细</summary><div id="matches"></div></details>
       </details>
+      <div id="merge-rules"></div>
       <div class="row actions"><button id="approve" class="primary" disabled>开始追番</button><button id="hold" hidden>暂停追番</button><button id="refresh">刷新版本</button></div>
       <div id="message" role="status">正在读取版本…</div>`;
     this.$ = id => this.shadowRoot.getElementById(id);
@@ -106,6 +107,19 @@ class Detail extends HTMLElement {
       this.$('approve').textContent = data.rule.state === 'approved' ? '保存版本' : '开始追番';
       this.$('notice').hidden = data.health.ready;
       this.$('notice').textContent = '请先在 AB 设置 → 订阅审核中启用保护，再开启聚合 RSS。';
+      this.$('merge-rules').replaceChildren();
+      for (const other of data.merge_options || []) {
+        const button = document.createElement('button');
+        button.textContent = `备份并将同一蜜柑条目的规则 #${other} 合入本条 #${this.rid}`;
+        button.onclick = async () => {
+          button.disabled = true;
+          try {
+            await this.host.api.post(`rules/${this.rid}/merge/${other}`, {});
+            location.reload();
+          } catch (e) { this.error(e); button.disabled = false; }
+        };
+        this.$('merge-rules').append(button);
+      }
       this.$('choices').replaceChildren();
       const any = document.createElement('label'); any.className = 'choice';
       const anyRadio = document.createElement('input'); anyRadio.type = 'checkbox'; anyRadio.name = 'unfiltered';

@@ -50,6 +50,12 @@ class Store:
                 CREATE TABLE IF NOT EXISTS reservations (
                     episode_key TEXT PRIMARY KEY, url TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS mikan_episodes (
+                    episode TEXT PRIMARY KEY, series INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS mikan_bindings (
+                    rule_id INTEGER PRIMARY KEY, fingerprint TEXT NOT NULL, series INTEGER NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS torrent_file_lists (
                     infohash TEXT PRIMARY KEY, paths TEXT NOT NULL
                 );
@@ -165,6 +171,26 @@ class Store:
                         )
 
         await self.call(merge)
+
+    async def discard_shadows(self, shadows):
+        """The canonical host copy is already imported. Preserve its earliest sighting."""
+
+        def clean(db):
+            for candidate, owner in shadows:
+                url = candidate["url"]
+                if db.execute("SELECT 1 FROM reservations WHERE url=?", (url,)).fetchone():
+                    continue
+                updated = db.execute(
+                    "UPDATE candidates SET first_seen=MIN(first_seen,?) WHERE rule_id=? AND url=?",
+                    (candidate["first_seen"], owner, url),
+                ).rowcount
+                if updated:
+                    db.execute(
+                        "DELETE FROM candidates WHERE id=? AND status='held'", (candidate["id"],)
+                    )
+
+        if shadows:
+            await self.call(clean)
 
     async def refresh_metadata(self, updates):
         def update(db):

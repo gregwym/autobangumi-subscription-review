@@ -26,7 +26,8 @@ from .batch import (
     project_batch,
 )
 from .feature import confirmed_features, dedicated_feed
-from .file_batch import FileBatches
+from .file_batch import FileBatches, numbered_title_aliases
+from .mikan_series import TORRENT, MikanSeries, episode_hash, release_page
 from .policy import fingerprint
 from .versions import version_traits
 
@@ -43,6 +44,7 @@ class Bridge40:
         self.features = {}
         self.file_batches = FileBatches(store)
         self.file_ranges = {}
+        self.mikan = MikanSeries(store, self.rule_data)
         self.permit = contextvars.ContextVar("subscription_review_permit", default=None)
 
     async def setup(self):
@@ -79,6 +81,7 @@ class Bridge40:
             "matches",
         ]:
             raise RuntimeError("AB 批次过滤接口已变化；拒绝安装适配层")
+        await self.mikan.load()
         bridge = self
 
         @traced("rss.capture", quiet=True, audit=bridge.audit)
@@ -129,7 +132,7 @@ class Bridge40:
                 raise RuntimeError("审核下载器不允许创建绕过审核的 qB RSS 规则")
 
         def reviewed_match(engine, torrent, rules):
-            selected = bridge.match_rule(torrent.name, rules)
+            selected = bridge.mikan.match(torrent, rules, bridge.match_rule, bridge.file_ranges)
             if not selected or global_excluded(torrent.name):
                 return None
             if selected.filter and engine._get_filter_pattern(selected.filter).search(torrent.name):
@@ -139,10 +142,29 @@ class Bridge40:
 
         async def reviewed_discovery(analyser, rss, torrents, engine, bangumi_list):
             with parser_engine_snapshot():
-                regular, batches = [], []
+                regular, batches, grouped = [], [], False
+                deadline = asyncio.get_running_loop().time() + 8
                 for torrent in await engine.db.torrent.check_new(torrents, rss=rss):
                     if global_excluded(torrent.name):
                         continue
+                    page = release_page(torrent.url, torrent.homepage)
+                    if page:
+                        if (
+                            episode_hash(page) not in bridge.mikan.pages
+                            and asyncio.get_running_loop().time() >= deadline
+                        ):
+                            continue
+                        series = await bridge.mikan.resolve(page)
+                        if not series:
+                            continue
+                        if series:
+                            async with bridge.mikan.discovery_lock:
+                                handled = await bridge.mikan.discover(
+                                    analyser, rss, engine, torrent, series
+                                )
+                            if handled:
+                                grouped = True
+                                continue
                     normalized, release = parse_review_release(torrent.name)
                     batch = bounded_batch(torrent.name, release)
                     if batch is not None:
@@ -159,7 +181,7 @@ class Bridge40:
                     added += await discover_batches(
                         analyser, rss, engine, batches, rules, bridge.match_rule
                     )
-                return added
+                return await engine.db.bangumi.search_all() if grouped else added
 
         async def reviewed_link(analyser, rss):
             with parser_engine_snapshot():
@@ -406,6 +428,10 @@ class Bridge40:
                     if (
                         not target
                         or target.id == old.id
+                        or (
+                            self.mikan.identity(old)
+                            and self.mikan.identity(target) != self.mikan.identity(old)
+                        )
                         or target.archived
                         or self.exclusion_check(target.filter)(torrent.name)
                         or old.official_title != target.official_title
@@ -509,14 +535,16 @@ class Bridge40:
         return {k: getattr(torrent, k, None) for k in ("name", "url", "homepage", "rss_id")}
 
     @staticmethod
-    def parsed_data(rule, name, *, feature=False, file_range=None):
+    def parsed_data(rule, name, *, feature=False, file_range=None, inspect_title=False):
         from module.manager.revision_policy import _adjust_episode
         from module.parser.analyser.tokenizer.result import MediaType, ReleaseKind
         from module.parser.release_policy import preference_identity, preference_revision
 
         normalized, release = parse_review_release(name)
         batch = bounded_batch(name, release)
-        if file_range and release and batch is None:
+        if file_range and file_range[0] == file_range[1] and release:
+            release = replace(release, episode=file_range[0])
+        elif file_range and release and batch is None:
             batch = replace(
                 release,
                 episode=file_range[0],
@@ -555,6 +583,14 @@ class Bridge40:
             and (batch.season is None or batch.season == rule.season)
         ):
             identity = (batch.media_type, rule.season, batch.episode)
+        uncertain = (
+            inspect_title
+            and not file_range
+            and not batch
+            and numbered_title_aliases(name, rule, release)
+        )
+        if uncertain:
+            identity = None
         fields = {
             k: getattr(release, k, None)
             for k in ("group", "resolution", "source", "subtitle", "episode")
@@ -564,6 +600,8 @@ class Bridge40:
         label = re.match(r"^【([^】]{1,80})】(?=\[)", name)
         if release and not fields["group"] and label:
             fields["group"] = label[1]
+        if uncertain:
+            fields["episode"] = None
         fields["episode_key"] = None
         fields["episode_end"] = batch.episode_end if batch else None
         fields["feature"] = feature
@@ -592,9 +630,19 @@ class Bridge40:
         fp = fingerprint(self.rule_data(rule))
         feature = self.features.get(key) == fp
         proof = self.file_ranges.get(key)
-        return self.parsed_data(
-            rule, name, feature=feature, file_range=proof[1] if proof and proof[0] == fp else None
+        data = self.parsed_data(
+            rule,
+            name,
+            feature=feature,
+            file_range=proof[1] if proof and proof[0] == fp else None,
+            inspect_title=bool(TORRENT.fullmatch(url)),
         )
+
+        series = self.mikan.identity(rule)
+        if series and data["episode_key"]:
+            identity = json.loads(data["episode_key"])
+            data["episode_key"] = json.dumps([*identity, series], ensure_ascii=False)
+        return data
 
     async def capture(self, rule, torrent, *, first_seen=None):
         if not rule.id:
@@ -636,13 +684,14 @@ class Bridge40:
             history = await db.torrent.search_all()
             sources = {rss.id: dedicated_feed(rss.url) for rss in await db.rss.search_all()}
         by_id = {r.id: r for r in rules if not r.deleted}
+        await self.mikan.observe(by_id, history, inspect_files)
         retained = await self.store.candidates()
         records = [(t.bangumi_id, self.torrent_data(t)) for t in history] + [
             (c["rule_id"], c) for c in retained
         ]
         identified = confirmed_features(by_id, records, sources)
         file_ranges = await self.file_batches.identify(
-            by_id, records, sources, identified, network=inspect_files
+            by_id, records, sources, identified, network=inspect_files, mikan=self.mikan
         )
         async with self.lock:
             retained = await self.store.candidates()
@@ -662,6 +711,23 @@ class Bridge40:
                 if t.bangumi_id in by_id
             ]
             await self.store.import_history([self.rule_data(r) for r in by_id.values()], entries)
+            shadows = []
+            for c in retained:
+                owner = self.mikan.owners.get(c["url"])
+                key = episode_hash(release_page(c["url"], c.get("homepage")))
+                series = self.mikan.pages.get(key)
+                if (
+                    c["status"] == "held"
+                    and owner != c["rule_id"]
+                    and owner in by_id
+                    and c["rule_id"] in by_id
+                    and series
+                    and self.mikan.identity(by_id[owner])
+                    == self.mikan.identity(by_id[c["rule_id"]])
+                    == series
+                ):
+                    shadows.append((c, owner))
+            await self.store.discard_shadows(shadows)
             # Refresh metadata of retained candidates too, including rows whose
             # original AB rule was deleted. No approval is granted here.
             from types import SimpleNamespace

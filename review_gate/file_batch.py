@@ -8,12 +8,10 @@ from pathlib import PurePosixPath
 
 import httpx2
 
-from .batch import SEASON, parse_review_release
+from .batch import EXTRAS, SEASON, parse_review_release
 from .feature import dedicated_feed, normalized_title
+from .mikan_series import TORRENT, episode_hash, release_page
 
-TORRENT = re.compile(
-    r"https://(?:mikanani\.me|mikanime\.tv)/Download/\d{8}/([a-fA-F0-9]{40})\.torrent"
-)
 LIMIT = 4 * 1024 * 1024
 VIDEO = {
     ".mkv",
@@ -37,6 +35,24 @@ GROUP = re.compile(r"^\s*(?:\[[^\]]+\]|【[^】]+】)\s*")
 MARKER = re.compile(
     r"(?i)(?:\[(\d{1,3})\]|\s-\s*(\d{1,3})(?=\s|$)|(?<!\w)S(\d{1,2})E(\d{1,3})(?!\d))"
 )
+
+
+def numbered_title_aliases(name, rule, release):
+    """A number shared by title aliases is not independent episode evidence."""
+    if not release or type(release.episode) is not int or release.episode_end is not None:
+        return set()
+    raw = GROUP.sub("", unicodedata.normalize("NFKC", name))
+    title = re.match(r"^\[([^\]]+)\]", raw)
+    if not title or MARKER.search(raw[title.end() :]):
+        return set()
+    suffix = re.compile(rf"(?<!\d)0*{release.episode}$")
+    aliases = {
+        normalized_title(alias)
+        for alias in re.split(r"[/_]", title[1])
+        if suffix.search(alias.strip()) and not alias.strip().isdigit()
+    }
+    known = {normalized_title(rule.official_title), normalized_title(rule.title_raw)}
+    return aliases if len(aliases) > 1 or aliases & known else set()
 
 
 def decode_paths(data, digest):
@@ -88,6 +104,10 @@ def decode_paths(data, digest):
         raise ValueError("missing info")
     paths = []
     files = info.get(b"files", [])
+    if b"files" not in info and b"length" in info:
+        files = [
+            {b"path": [info.get(b"name.utf-8", info.get(b"name"))], b"length": info[b"length"]}
+        ]
     if not isinstance(files, list):
         raise ValueError("invalid file list")
     for item in files:
@@ -122,7 +142,7 @@ async def fetch_paths(url, digest):
     return await asyncio.to_thread(decode_paths, bytes(data), digest)
 
 
-def episode_range(paths, name, rule):
+def episode_range(paths, name, rule, *, numbered_aliases=frozenset()):
     from module.parser.analyser.tokenizer.result import MediaType, ReleaseKind
 
     titles = {normalized_title(t) for t in (rule.official_title, rule.title_raw)}
@@ -135,12 +155,30 @@ def episode_range(paths, name, rule):
     # Publishers often provide a clean alternative in a slash-delimited title.
     parts = GROUP.sub("", name).split(" / ")
     titles.update(normalized_title(part) for part in parts[:-1])
+    titles.update(numbered_aliases)
     numbers = set()
+    collection_title = None
     common_title = None
     for path in paths:
         stem = unicodedata.normalize("NFKC", PurePosixPath(path).stem)
         clean = GROUP.sub("", stem)
         markers = list(MARKER.finditer(clean))
+        # Some releases include a concatenated copy alongside the numbered files.
+        # Only accept the explicit tag attached to the same verified series title.
+        collection = re.fullmatch(r"\[([^\]]+)\]\s*\[Collection\](?:\s*\[[^\]]+\])*", clean, re.I)
+        if any(SEASON.search(folder) for folder in PurePosixPath(path).parts[:-1]):
+            return None
+        if collection and not markers:
+            title = normalized_title(collection[1])
+            if (
+                not title
+                or title not in titles
+                or collection_title is not None
+                or EXTRAS.search(clean)
+            ):
+                return None
+            collection_title = title
+            continue
         if len(markers) != 1:
             return None
         marker = markers[0]
@@ -151,7 +189,16 @@ def episode_range(paths, name, rule):
             not parsed
             or parsed.release_kind is not ReleaseKind.SINGLE
             or parsed.media_type is not MediaType.EPISODE
-            or parsed.episode != episode
+            or (
+                parsed.episode != episode
+                and not (
+                    title in numbered_aliases
+                    and parsed.episode == release.episode
+                    and clean[: marker.start()].strip().startswith("[")
+                    and clean[: marker.start()].strip().endswith("]")
+                    and not EXTRAS.search(clean)
+                )
+            )
             or parsed.season not in (None, rule.season)
             or not title
             or title not in titles
@@ -159,12 +206,13 @@ def episode_range(paths, name, rule):
             or episode in numbers
         ):
             return None
-        # Nested directories can carry a season omitted from the filename.
-        if any(SEASON.search(folder) for folder in PurePosixPath(path).parts[:-1]):
-            return None
         numbers.add(episode)
         common_title = title
-    if len(numbers) >= 2 and max(numbers) - min(numbers) + 1 == len(numbers):
+    if collection_title is not None and (collection_title != common_title or len(numbers) < 2):
+        return None
+    if (len(numbers) >= 2 or (numbered_aliases and len(numbers) == 1)) and max(numbers) - min(
+        numbers
+    ) + 1 == len(numbers):
         return min(numbers), max(numbers)
     return None
 
@@ -174,7 +222,7 @@ class FileBatches:
         self.store = store
         self.retry_at = {}
 
-    async def identify(self, rules, records, sources, features, *, network):
+    async def identify(self, rules, records, sources, features, *, network, mikan=None):
         from module.database.bangumi import _all_title_patterns, _normalize_group_name
         from module.parser.analyser.tokenizer.result import MediaType, ReleaseKind
 
@@ -192,18 +240,25 @@ class FileBatches:
                 not rule
                 or rule.episode_type != "episode"
                 or not match
-                or not feed
                 or key in seen
                 or key in features
             ):
                 continue
-            if feed not in {dedicated_feed(link) for link in (rule.rss_link or "").split(",")}:
+            series = mikan and mikan.pages.get(
+                episode_hash(release_page(url, torrent.get("homepage")))
+            )
+            verified = series and mikan.identity(rule) == series
+            if not verified and (
+                not feed
+                or feed not in {dedicated_feed(link) for link in (rule.rss_link or "").split(",")}
+            ):
                 continue
             seen.add(key)
             release = parse_review_release(name)[1]
+            aliases = numbered_title_aliases(name, rule, release)
             if (
                 not release
-                or release.episode is not None
+                or (release.episode is not None and not aliases)
                 or release.season not in (None, rule.season)
                 or release.release_kind
                 not in (ReleaseKind.SINGLE, ReleaseKind.BATCH, ReleaseKind.COLLECTION)
@@ -213,7 +268,7 @@ class FileBatches:
             names = {
                 normalized_title(t) for t in (*_all_title_patterns(rule), rule.official_title) if t
             }
-            if (
+            if not verified and (
                 not any(
                     normalized_title(t) in names
                     for t in (release.title_en, release.title_jp, release.title_zh)
@@ -237,7 +292,7 @@ class FileBatches:
                 await self.store.save_file_list(digest, paths)
                 cache[digest] = paths
                 self.retry_at.pop(digest, None)
-            span = episode_range(cache[digest], name, rule)
+            span = episode_range(cache[digest], name, rule, numbered_aliases=aliases)
             if span:
                 proofs[key] = span
         return proofs
