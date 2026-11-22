@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from review_gate.file_batch import decode_paths, episode_range
+from review_gate.file_batch import decode_paths, episode_range, movie_contents
 from review_gate.policy import Policy
 from review_gate.versions import variants
 
@@ -88,6 +88,83 @@ async def test_unnumbered_pack_is_selectable_and_obeys_existing_policy(plugin, r
     await plugin.bridge.replay()
     fetch.assert_awaited_once()
     assert plugin.test_send.await_count == 1
+
+
+MOVIE = "[Group] Example Show / テスト作品 10-bit 1080p HEVC BDRip [MOVIE Fin]"
+MAIN = "[Group] Example Show [Ma10p_1080p][x265_flac].mkv"
+
+
+def test_movie_manifest_requires_matching_main_video(rule):
+    from review_gate.batch import parse_review_release
+
+    release = parse_review_release(MOVIE)[1]
+    assert movie_contents([MAIN], release, rule).special == "MOVIE"
+    for paths in (
+        [],
+        [MAIN, MAIN],
+        [MAIN.replace("Example Show", "Other Title")],
+        [MAIN.replace(" [Ma10p", " - 01 [Ma10p")],
+        [MAIN.replace(" [Ma10p", " [Trailer] [Ma10p")],
+        ["Menu/" + MAIN],
+        ["Season 2/" + MAIN],
+    ):
+        assert movie_contents(paths, release, rule) is None
+    trailer = parse_review_release(MOVIE + " [PV]")[1]
+    assert movie_contents([MAIN], trailer, rule) is None
+
+
+@pytest.mark.parametrize("rule_type", ["episode", "movie"])
+async def test_tagged_movie_appears_after_manifest_check(plugin, rule, api, monkeypatch, rule_type):
+    from module.database import Database
+    from module.models import RSSItem, Torrent
+
+    from review_gate import file_batch, mikan_series
+
+    data, digest = metainfo([MAIN, "SPs/Behind the Scenes.mkv", "SPs/Menu.mkv"])
+    url = f"https://mikanani.me/Download/20260101/{digest}.torrent"
+    fetch = AsyncMock(return_value=decode_paths(data, digest))
+    monkeypatch.setattr(file_batch, "fetch_paths", fetch)
+    monkeypatch.setattr(mikan_series, "fetch_series", AsyncMock(return_value=123))
+    async with Database() as db:
+        rss = RSSItem(url="https://mikanani.me/RSS/Bangumi?bangumiId=123&subgroupid=987")
+        db.add(rss)
+        rule.rss_link, rule.episode_type = rss.url, rule_type
+        db.add(rule)
+        await db.session.flush()
+        db.add(
+            Torrent(
+                name=MOVIE,
+                url=url,
+                homepage=f"https://mikanani.me/Home/Episode/{digest}",
+                rss_id=rss.id,
+                bangumi_id=rule.id,
+            )
+        )
+        await db.commit()
+    await plugin.bridge.sync_history()
+    assert not variants(await plugin.store.candidates(rule.id))
+    await plugin.bridge.sync_history(inspect_files=True)
+    async with api:
+        response = await api.get(f"/review/rules/{rule.id}/versions")
+        [v] = response.json()["versions"]
+    assert (v["kind"], v["resolution"], v["codec"], v["source"]) == (
+        "feature",
+        "1080p",
+        "HEVC",
+        "BDRip",
+    )
+    [candidate] = await plugin.store.candidates(rule.id)
+    assert candidate["status"] == "held" and candidate["episode"] is None
+    assert Policy(unfiltered=True).reason(candidate)
+    assert not Policy(version_ids=[v["id"]]).reason(candidate)
+    if rule_type == "episode":
+        from review_gate.versions import version_traits
+
+        assert v["id"] != version_traits(dict(candidate, file_special=None))[0]
+    await plugin.bridge.sync_history()
+    assert variants(await plugin.store.candidates(rule.id))[0]["id"] == v["id"]
+    fetch.assert_awaited_once_with(url, digest)
+    plugin.test_send.assert_not_called()
 
 
 def test_special_manifest_rejects_mixed_shows_and_gaps():

@@ -33,6 +33,13 @@ VIDEO = {
 }
 EXTRA_DIRS = {"sps", "extras", "bonus", "特典", "映像特典"}
 GROUP = re.compile(r"^\s*(?:\[[^\]]+\]|【[^】]+】)\s*")
+MOVIE_LABEL = re.compile(r"[\[【]\s*(?:movie|剧场版|劇場版)(?:[\s._-]+(?:fin|end))?\s*[\]】]", re.I)
+EXTRA_VIDEO = re.compile(
+    r"(?<![a-z0-9])(?:trailers?|teasers?|previews?|promo|pv|mv|cm|ncop|nced|op|ed|menus?|samples?|"
+    r"making[ -]of|behind[ -]the[ -]scenes|bonus|extras?|sp)(?:\d+)?(?![a-z0-9])|"
+    r"预告|預告|予告|花絮|特典|メイキング",
+    re.I,
+)
 # Keep the title preceding the actual episode marker; remove release tags afterwards.
 MARKER = re.compile(
     r"(?i)(?:\[(\d{1,3})\]|\s-\s*(\d{1,3})(?=\s|$)|(?<!\w)S(\d{1,2})E(\d{1,3})(?!\d))"
@@ -191,6 +198,42 @@ class FileContents:
     resolution: str | None = None
 
 
+def movie_contents(paths, release, rule):
+    """Confirm a movie label against the sole main video's title and type."""
+    from module.parser.analyser.tokenizer.result import MediaType, ReleaseKind
+
+    if len(paths) != 1:
+        return None
+    path = PurePosixPath(paths[0])
+    stem = unicodedata.normalize("NFKC", path.stem)
+    if EXTRA_VIDEO.search(str(path)) or EXTRA_VIDEO.search(release.raw) or MARKER.search(stem):
+        return None
+    video = parse_review_release(stem)[1]
+    if (
+        not video
+        or video.media_type not in (MediaType.UNKNOWN, MediaType.MOVIE)
+        or video.release_kind is not ReleaseKind.SINGLE
+        or video.episode is not None
+        or video.season is not None
+        or any(SEASON.search(p) for p in path.parts[:-1])
+    ):
+        return None
+    titles = [
+        release.title_en,
+        release.title_jp,
+        release.title_zh,
+        rule.official_title,
+        rule.title_raw,
+    ]
+    # A bilingual post can have a clean first title even when AB folds later
+    # language segments or encoding tags into its parsed English title.
+    titles.extend(GROUP.sub("", release.raw).split(" / ")[:-1])
+    title = normalized_title(video.primary_title)
+    if not title or title not in {normalized_title(t) for t in titles if t}:
+        return None
+    return FileContents(special="MOVIE", resolution=video.resolution)
+
+
 def special_contents(paths, release, rule):
     """Read explicit episode numbers and special labels from a verified release's manifest."""
     from module.parser.analyser.tokenizer.result import MediaType, ReleaseKind
@@ -276,7 +319,7 @@ class FileBatches:
             match = TORRENT.fullmatch(url)
             if (
                 not rule
-                or rule.episode_type not in ("episode", "special")
+                or rule.episode_type not in ("episode", "special", "movie")
                 or not match
                 or key in seen
                 or key in features
@@ -293,18 +336,38 @@ class FileBatches:
                 continue
             seen.add(key)
             release = parse_review_release(name)[1]
+            if not release:
+                continue
             inspect_special = (
-                verified and release and release.episode is None and SPECIAL_TITLE.search(name)
+                verified
+                and rule.episode_type != "movie"
+                and release.episode is None
+                and SPECIAL_TITLE.search(name)
+            )
+            inspect_movie = (
+                rule.episode_type in ("movie", "episode")
+                and release.season is None
+                and release.episode is None
+                and release.release_kind is ReleaseKind.SINGLE
+                and (not series or not mikan.identity(rule) or verified)
+                and (
+                    (
+                        release.media_type is MediaType.UNKNOWN
+                        and MOVIE_LABEL.search(unicodedata.normalize("NFKC", name))
+                    )
+                    # Existing movie rules already accept parsed movies with a stable version ID.
+                    or (release.media_type is MediaType.MOVIE and rule.episode_type == "episode")
+                )
             )
             aliases = numbered_title_aliases(name, rule, release)
             if (
-                not release
-                or (release.episode is not None and not aliases)
+                (release.episode is not None and not aliases)
                 or release.season not in (None, rule.season)
                 or release.release_kind
                 not in (ReleaseKind.SINGLE, ReleaseKind.BATCH, ReleaseKind.COLLECTION)
                 or (
                     not inspect_special
+                    and not inspect_movie
                     and (
                         rule.episode_type != "episode"
                         or release.media_type not in (MediaType.UNKNOWN, MediaType.EPISODE)
@@ -339,8 +402,9 @@ class FileBatches:
                 await self.store.save_file_list(digest, paths)
                 cache[digest] = paths
                 self.retry_at.pop(digest, None)
-            if inspect_special:
-                content = special_contents(cache[digest], release, rule)
+            if inspect_movie or inspect_special:
+                identify = movie_contents if inspect_movie else special_contents
+                content = identify(cache[digest], release, rule)
                 if content:
                     proofs[key] = content
                 continue

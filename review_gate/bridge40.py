@@ -681,7 +681,11 @@ class Bridge40:
             name,
             feature=feature or bool(content and content.special and content.span is None),
             file_range=content.span if content else None,
-            file_special=content.special if content else None,
+            file_special=(
+                content.special
+                if content and not (rule.episode_type == "movie" and content.special == "MOVIE")
+                else None
+            ),
             file_resolution=content.resolution if content else None,
             inspect_title=bool(TORRENT.fullmatch(url)),
         )
