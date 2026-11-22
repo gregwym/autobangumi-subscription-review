@@ -50,9 +50,27 @@ class Store:
                 CREATE TABLE IF NOT EXISTS reservations (
                     episode_key TEXT PRIMARY KEY, url TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS torrent_file_lists (
+                    infohash TEXT PRIMARY KEY, paths TEXT NOT NULL
+                );
             """)
 
         await self.call(create)
+
+    async def file_lists(self):
+        return await self.call(
+            lambda db: {
+                row["infohash"]: json.loads(row["paths"])
+                for row in db.execute("SELECT infohash,paths FROM torrent_file_lists")
+            }
+        )
+
+    async def save_file_list(self, digest, paths):
+        await self.call(
+            lambda db: db.execute(
+                "INSERT OR IGNORE INTO torrent_file_lists VALUES(?,?)", (digest, json.dumps(paths))
+            ).close()
+        )
 
     @staticmethod
     def _rule(db, rule):

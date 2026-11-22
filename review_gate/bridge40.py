@@ -13,6 +13,7 @@ import inspect
 import json
 import logging
 import re
+from dataclasses import replace
 
 from .audit import Audit, traced
 from .batch import (
@@ -25,6 +26,7 @@ from .batch import (
     project_batch,
 )
 from .feature import confirmed_features, dedicated_feed
+from .file_batch import FileBatches
 from .policy import fingerprint
 from .versions import version_traits
 
@@ -39,6 +41,8 @@ class Bridge40:
         self.replay_lock = asyncio.Lock()
         self.active = False
         self.features = {}
+        self.file_batches = FileBatches(store)
+        self.file_ranges = {}
         self.permit = contextvars.ContextVar("subscription_review_permit", default=None)
 
     async def setup(self):
@@ -505,13 +509,21 @@ class Bridge40:
         return {k: getattr(torrent, k, None) for k in ("name", "url", "homepage", "rss_id")}
 
     @staticmethod
-    def parsed_data(rule, name, *, feature=False):
+    def parsed_data(rule, name, *, feature=False, file_range=None):
         from module.manager.revision_policy import _adjust_episode
-        from module.parser.analyser.tokenizer.result import ReleaseKind
+        from module.parser.analyser.tokenizer.result import MediaType, ReleaseKind
         from module.parser.release_policy import preference_identity, preference_revision
 
         normalized, release = parse_review_release(name)
         batch = bounded_batch(name, release)
+        if file_range and release and batch is None:
+            batch = replace(
+                release,
+                episode=file_range[0],
+                episode_end=file_range[1],
+                release_kind=ReleaseKind.RANGE,
+                media_type=MediaType.EPISODE,
+            )
         if batch is not None:
             release = batch
         # AB 4.0 tokenizer can read the season in "Euphonium 3 [13]" as
@@ -576,9 +588,13 @@ class Bridge40:
         return fields
 
     def parse_candidate(self, rule, name, url):
-        proof = self.features.get((rule.id, url, name))
-        feature = proof is not None and proof == fingerprint(self.rule_data(rule))
-        return self.parsed_data(rule, name, feature=feature)
+        key = (rule.id, url, name)
+        fp = fingerprint(self.rule_data(rule))
+        feature = self.features.get(key) == fp
+        proof = self.file_ranges.get(key)
+        return self.parsed_data(
+            rule, name, feature=feature, file_range=proof[1] if proof and proof[0] == fp else None
+        )
 
     async def capture(self, rule, torrent, *, first_seen=None):
         if not rule.id:
@@ -611,7 +627,7 @@ class Bridge40:
                 is None
             )
 
-    async def sync_history(self):
+    async def sync_history(self, *, inspect_files=False):
         from module.database import Database
 
         await self.repair_associations()
@@ -620,15 +636,21 @@ class Bridge40:
             history = await db.torrent.search_all()
             sources = {rss.id: dedicated_feed(rss.url) for rss in await db.rss.search_all()}
         by_id = {r.id: r for r in rules if not r.deleted}
+        retained = await self.store.candidates()
+        records = [(t.bangumi_id, self.torrent_data(t)) for t in history] + [
+            (c["rule_id"], c) for c in retained
+        ]
+        identified = confirmed_features(by_id, records, sources)
+        file_ranges = await self.file_batches.identify(
+            by_id, records, sources, identified, network=inspect_files
+        )
         async with self.lock:
             retained = await self.store.candidates()
-            identified = confirmed_features(
-                by_id,
-                [(t.bangumi_id, self.torrent_data(t)) for t in history]
-                + [(c["rule_id"], c) for c in retained],
-                sources,
-            )
             self.features = {key: fingerprint(self.rule_data(by_id[key[0]])) for key in identified}
+            self.file_ranges = {
+                key: (fingerprint(self.rule_data(by_id[key[0]])), span)
+                for key, span in file_ranges.items()
+            }
             entries = [
                 (
                     self.rule_data(by_id[t.bangumi_id]),
@@ -851,7 +873,7 @@ class Bridge40:
     @traced("maintenance.queue", quiet=True)
     async def replay(self):
         async with self.replay_lock:
-            await self.sync_history()
+            await self.sync_history(inspect_files=True)
             repairs = await self.repair_orphans()
             result = await self._replay()
             self.audit.periodic(
